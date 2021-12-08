@@ -1,0 +1,140 @@
+#!/usr/bin/env mew_js
+
+@import("mewchan.mgnt");
+
+@.process.mode = "customized";
+
+const switchesRules = {
+    "!defaultTaskMode": "mew",
+    "!programName": "mew",
+    "!taskModes": {
+        "help": "help",
+        "version": "version",
+    },
+    "!taskHelp": {
+        "prefix": "Program mew targets to help mew_js users to run mewchan\nprototype",
+        "modes": {
+            "mew": {
+                "text": "Run a mewchan prototype",
+                "command": "mew [<dir|chan|brain> ...]"
+            },
+            "help": "Print help text",
+            "version": "Report mew version"
+        },
+        "suffix": "More info is available at https://www.mewchan.com"
+    },
+    "options": {
+        "logMewWithUsages": {
+            "!valueType": "array",
+            "!autoresolveArray": true,
+            "!arrayElement": { "!valueType": "string" },
+            "!switchText": "Log mew with maught usages"
+        },
+        "logInternalMews": {
+            "!valueType": "boolean",
+            "!switchText": "Whether to log mewchan internal mews"
+        },
+        "logOnlyMewUsage": {
+            "!valueType": "boolean",
+            "!switchText": "Whether to only log mew usage, not detail info",
+        },
+        "printMascot": {
+            "!valueType": "boolean",
+            "!switchText": "Whether to print mewmew mascot mewchan at start"
+        },
+    },
+    "settings": {
+        "help": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Force to print help text"
+        },
+        "version": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Force to print mew_chan version text"
+        }
+    }
+};
+
+const switches = @.process.switches(switchesRules);
+
+if ((switches.mode === "help") || switches.settings.help) {
+    @.task.printHelp(switchesRules);
+    process.exit(0);
+    return;
+}
+
+if ((switches.mode === "version") || switches.settings.version) {
+    @.process.print("mew version 1.0.0");
+    process.exit(0);
+    return;
+}
+
+let chans = [];
+let dirs = [];
+let brain = undefined;
+for (let file of switches.commands) {
+    let path = @path(file);
+    if (!@.fs.exists(path)) {
+        @error(`Resource not found: ${file}`);
+        process.exit(1);
+    }
+    if (@.fs.exists.dir(path)) {
+        dirs.push(path);
+    } else if (@.fs.exists.file(path)) {
+        let extname = @.fs.extname(path);
+        switch (extname) {
+            case ".chan": { chans.push(path); break; };
+            case ".js": {
+                if (brain) {
+                    @error("Multiple brain specified");
+                    process.exit(1);
+                }
+                brain = path;
+                break;
+            };
+            default: {
+                @error(`Unknown file to process ${file}`);
+                process.exit(1);
+            };
+        }
+    }
+}
+
+let logMewWithUsages = switches.options.logMewWithUsages;
+if (switches.settings.debug && (!logMewWithUsages)) {
+    logMewWithUsages = ["*"];
+}
+
+@mewchan.start(dirs.slice(0).concat(chans), switches.options.presets, {
+    "brainPath": brain,
+    "logMewWithUsages": logMewWithUsages,
+    "logInternalMews": switches.options.logInternalMews,
+    "logOnlyMewUsage": switches.options.logOnlyMewUsage,
+    "printMascot": switches.options.printMascot
+}).then(function (mewchan) {
+
+    // mewchan.includeKitty(name, path, options, profile);
+    // mewchan.injectMew(from, usage);
+    // mewchan.emitMew(from, usage, content);
+    // mewchan.sendMew(from, play, usage, content, options);
+    // mewchan.rpcMew(from, play, usage, content, options);
+    // mewchan.introduceElder(usage, elder);
+    // mewchan.registerInterpreter(source).to(target).via(translator);
+    // mewchan.getMewPromises(from, usage);
+    // mewchan.buildPlayground(id, options);
+    // mewchan.installServlet(kitty, playground, id, options, position);
+
+    @celebr("Mewchan has been started");
+
+    @debug(mewchan.agent);
+
+    this.next();
+
+}).finished(function (error) {
+
+    if (error) {
+        @error(error);
+        process.exit(1);
+    }
+
+});

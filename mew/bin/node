@@ -1,0 +1,5 @@
+#!/bin/sh
+
+mew_js "$@"
+
+exit $?

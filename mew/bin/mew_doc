@@ -1,0 +1,118 @@
+#!/usr/bin/env mew_js
+
+@.process.mode = "customized";
+
+const switchesRules = {
+    "!defaultTaskMode": "unknown",
+    "!programName": "mew_doc",
+    "!taskModes": {
+        "gen": "generate", "generate": "generate",
+        "watch": "watch",
+        "help": "help",
+        "version": "version",
+    },
+    "!taskHelp": {
+        "prefix": "Program mew_doc targets to help mew_js users to generate\ndocumentations",
+        "modes": {
+            "watch": {
+                "command": "mew_doc [watch] [<source> [<output>]]",
+                "text": "Watch the sources, and update documentations\n    immeadiately after source changed"
+            },
+            "generate": {
+                "text": "Generate documentations",
+                "command": "mew_doc [gen|generate] [<source> [<output>]]"
+            },
+            "help": "Print help text",
+            "version": "Report mew_doc version"
+        },
+        "suffix": "More info is available at https://www.mewchan.com"
+    },
+    "options": {
+        "output": {
+            "!valueType": "string",
+            "!switchText": "Output dir path"
+        },
+        "noTodos": {
+            "!valueType": "boolean",
+            "!defaultValue": false,
+            "!switchText": "Whether to ignore TODO list"
+        },
+        "framework": {
+            "!valueType": "string",
+            "!switchText": "Framework to stringify documentations to html files"
+        },
+        "protectedTags": {
+            "!valueType": "array",
+            "!autoresolveArray": true,
+            "!switchText": "Contents with protected tags will be not exported",
+            "!arrayElement": { "!valueType": "string" }
+        },
+        "ignoredTags": {
+            "!valueType": "array",
+            "!autoresolveArray": true,
+            "!switchText": "Tags will be ignored in the outputs",
+            "!arrayElement": { "!valueType": "string" }
+        },
+        "excludes": {
+            "!valueType": "array",
+            "!autoresolveArray": "true",
+            "!switchText": "Path patterns to exclude while generating",
+            "!arrayElement": { "!valueType": "string" }
+        },
+        "entrance": {
+            "!valueType": "string",
+            "!defaultValue": "todos.html",
+            "!switchText": "Default entrance page"
+        },
+        "package": {
+            "!valueType": "string",
+            "!switchText": "Package name for your docs"
+        }
+    },
+    "settings": {
+        "help": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Force to print help text"
+        },
+        "version": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Force to print mew_doc version text"
+        }
+    }
+};
+
+const switches = @.process.switches(switchesRules);
+
+if ((switches.mode === "help") || switches.settings.help) {
+    @.task.printHelp(switchesRules);
+    process.exit(0);
+    return;
+}
+
+if ((switches.mode === "version") || switches.settings.version) {
+    @.process.print("mew_doc version 0.1.0");
+    process.exit(0);
+    return;
+}
+
+// TODO: add watch supports
+@.doc.gen(process.cwd(), {
+    "ignoredTags": switches.options.ignoredTags,
+    "protectedTags": switches.options.protectedTags,
+    "framework": switches.options.framework,
+    "entrance": switches.options.entrance,
+    "noTodos": switches.options.noTodos,
+    "output": switches.options.output,
+    "package": switches.options.package,
+}).finished(function (error) {
+
+    if (error) {
+        @error(error);
+        process.exit(1);
+    }
+
+    @celebr("Documentation has been generated");
+
+    process.exit();
+
+});

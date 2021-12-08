@@ -1,0 +1,504 @@
+#!/usr/bin/env mew_js
+
+@import("js.engine");
+@import("js.zip");
+
+const url = require("url");
+
+@.process.mode = "customized";
+
+const switchesRules = {
+    "!defaultTaskMode": "print",
+    "!programName": "mew_ver",
+    "!taskModes": {
+        "print": "print",
+        "status": "status", "check": "status",
+        "update": "upgrade", "upgrade": "upgrade",
+        "help": "help",
+        "version": "version",
+    },
+    "!taskHelp": {
+        "prefix": "Program mew_ver targets to help mew_js users to manage versions",
+        "modes": {
+            "print": {
+                "text": "Print mew_js version",
+                "command": "mew_ver [print]"
+            },
+            "status": {
+                "text": "Lookup version provided on server",
+                "command": "mew_ver check|status"
+            },
+            "upgrade": {
+                "text": "Upgrade mew_js",
+                "command": "mew_ver update|upgrade"
+            },
+            "help": "Print help text",
+            "version": "Report mew_chan version"
+        },
+        "suffix": "More info is available at https://www.mewchan.com"
+    },
+    "options": {
+        "force": {
+            "!valueType": "boolean",
+            "!defaultValue": false,
+            "!switchText": "Force to upgrade mew_js without version checks"
+        },
+        "target": {
+            "!valueType": "string",
+            "!switchText": "The target mew_js type, `clean` or `mixed`"
+        },
+        "hostClean": {
+            "!valueType": "string",
+            "!switchText": "The host service to clean mew_js versions"
+        },
+        "hostMixed": {
+            "!valueType": "string",
+            "!switchText": "The host service to mixed mew_js versions"
+        },
+        "onlyBuiltins": {
+            "!valueType": "boolean",
+            "!switchText": "Only considering builtin modules",
+            "!defaultValue": true
+        },
+        "optPath": {
+            "!valueType": "string",
+            "!switchText": "The install path of mew_js runtime",
+        }
+    },
+    "settings": {
+        "help": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Force to print help text"
+        },
+        "version": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Force to print mew_chan version text"
+        }
+    }
+};
+
+
+const switches = @.process.switches(switchesRules);
+
+const correctVersion = function (switches, code) {
+
+    let isClean = (require.resolve("mew_util") !== "mew_util");
+    if (isClean && (!switches.options.onlyBuiltins)) {
+        isClean = false;
+    }
+
+    switch (switches.options.target) {
+        case "clean": { isClean = true; break; } 
+        case "mixed": { isClean = false; break; } 
+        default: { break; }
+    }
+
+    if (isClean) {
+        if (code[0].toLowerCase() === code[0]) {
+            code = code.slice(0, 4) + "c--c--";
+        } else {
+            code = code.slice(0, 4) + "C--C--";
+        }
+    }
+
+    return code;
+
+};
+
+const printVersion = function (switches, noExit) {
+
+    return @engine.coreVersionCode().then(function (code) {
+
+        this.next(correctVersion(@.merge(switches, {
+            "options": {
+                "target": (require.resolve("mew_util") === "mew_util") ? true : false
+            }
+        }), code));
+
+    }).finished(function (error, code) {
+
+        if (noExit) {
+            return;
+        }
+
+        if (error) {
+            @error(error);
+            process.exit(1);
+        }
+
+        process.stdout.write(code + "\n");
+        process.exit(0);
+
+    });
+
+};
+
+const lookupVersions = function (switches, noExit) {
+
+    let optPath = switches.options.optPath;
+    if (!optPath) {
+        optPath = @path(process.argv[0], "../..");
+    }
+
+    return printVersion({
+        "options": {
+            "onlyBuiltins": true
+        }
+    }, true).then(function (code) {
+
+        @info("Current mew_js version: " + code);
+
+        let isClean = (require.resolve("mew_util") !== "mew_util");
+        if (switches.options.target) {
+            switch (switches.options.target) {
+                case "clean": { isClean = true; break; }
+                case "mixed": { isClean = false; break; }
+                default: {
+                    throw new Error(`Unknown target[${switches.options.target}]`);
+                }
+            }
+        }
+
+        let host = isClean ? switches.options.hostClean : switches.options.hostMixed;
+        if (!host) {
+            let paths = [ 
+                @.fs.homePath(".mew/conf/ver.json"), 
+                @path(optPath, "etc/mew_ver.json") 
+            ];
+            for (let mewJSVersionPath of paths) {
+                if ((!host) && @.fs.exists(mewJSVersionPath)) {
+                    try {
+                        let jsVersion = require(mewJSVersionPath);
+                        if (jsVersion.host) {
+                            host = @.format(jsVersion.host, {
+                                "target": isClean ? "clean" : "mixed",
+                                "platform": @.process.os,
+                                "arch": @.process.arch
+                            });
+                        }
+                        if (!host) {
+                            if (isClean) {
+                                host = jsVersion.hostClean;
+                            } else {
+                                host = jsVersion.hostMixed;
+                            }
+                        }
+                    } catch (error) {
+                        @warn("Failed to load default version configuation: " + mewJSVersionPath);
+                        @warn(error);
+                    }
+                }
+            }
+            
+        }
+        
+        if (!host) {
+            throw new Error("Host server for mew_js versions not found");
+        }
+
+        let client = @.net.httpClient();
+
+        @.async(function () {
+
+            client.request(host, {
+                "dataType": "json",
+                "onSuccess": this.next,
+                "onError": this.reject.once
+            });
+
+        }).then(function (data) {
+
+            if (!data.dist) {
+                throw new Error(`Dist not found at host[${host}]`);
+            }
+
+            let distURL = data.dist.file;
+            let splitted = distURL.split("://")[0];
+            if ((splitted[0] !== "http") && (splitted[0] !== "https")) {
+                let parsed = url.parse(host);
+                parsed.pathname = data.dist.file;
+                distURL = url.format(parsed);
+            }
+
+            let parsed = url.parse(distURL);
+
+            let hash = @.hash.sha1(distURL).slice(-8);
+            let distPath = @path(@.fs.homePath(".mew/arch"), "mew_js." + hash, @.fs.filename(parsed.pathname));
+
+            let sigPath = distPath + ".sig";
+
+            let distCode = undefined;
+            
+            @.async(function () {
+
+                if (@.fs.exists.file(sigPath)) {
+                    this.next(); return;
+                }
+
+                @.async(function () {
+
+                    @.fs.makeDirs(@.fs.dirname(distPath));
+
+                    @info(`Downloading ${distURL}`);
+
+                    client.download(distURL, distPath, {
+                        "deleteFileIfExists": true,
+                        "onError": this.reject,
+                        "onSuccess": this.next
+                    });
+
+                }).then(function () {
+
+                    @.fs.hash.sha1(distPath).then(function (hash) {
+
+                        @.fs.writeFile(sigPath, hash).pipe(this);
+
+                    }).pipe(this);
+
+                }).pipe(this);
+
+            }).then(function () {
+
+                @zip.load(distPath).then(function (zip) {
+
+                    zip.readFile("etc/mew_js.ver").then(function (distVer) {
+
+                        distCode = correctVersion({
+                            "options": { 
+                                "onlyBuiltins": true,
+                                "target": isClean ? "clean" : "mixed"
+                            }
+                        }, distVer.toString("utf8"));
+
+                        this.next(code !== distCode);
+
+                    }).pipe(this);
+
+                }).pipe(this);
+                
+            }).then(function (hasDifference) {
+
+                if (hasDifference) {
+                    @info(`The version[${distCode}] provided by host server is not current[${code}] we have, upgrade is needed`);
+                } else {
+                    @celebr(`Current mew_js already latest: ${code}`);
+                }
+
+                this.next(hasDifference, distPath, distCode);
+
+            }).pipe(this);
+
+        }).pipe(this);
+
+    }).finished(function (error) {
+
+        if (noExit) {
+            return;
+        }
+
+        if (error) {
+            @error(error);
+            process.exit(1);
+        }
+
+        process.exit();
+
+    });
+
+};
+
+const upgradeMewJS = function (switches) {
+
+    let optPath = switches.options.optPath;
+    if (!optPath) {
+        optPath = @path(process.argv[0], "../..");
+    }
+
+    lookupVersions(@.merge(switches, {
+        "options": { "onlyBuiltins": true }
+    }), true).then(function (hasDifference, distPath, newCode) {
+
+        if (!hasDifference) {
+            if (!switches.options.force) {
+                this.next(); return;
+            }
+            @info("Force upgrading mew_js");
+        }
+
+        @zip.load(distPath).then(function (zip) {
+
+            let links = [];
+
+            @.async.all(zip.files, function (record) {
+
+                let file = record.path;
+
+                @debug(`Upgrading file[${file}]`);
+
+                let entry = zip.getEntry(file);
+
+                let destPath = @path(optPath, file);
+
+                switch (entry.type) {
+
+                    case "dir": { 
+
+                        if (!@.fs.exists.dir(destPath)) {
+                            @.fs.makeDirs(destPath);
+                        }
+
+                        this.next();
+
+                        return;
+                    }
+
+                    case "file": { 
+
+                        if ((file === "bin/mew_js") ||
+                            (file === "bin/mew_js.exe")) {
+
+                            let fileCode = newCode;
+                            if (fileCode.slice(-6).toLowerCase() === "c--c--") {
+                                fileCode = fileCode.slice(0, 4);
+                            }
+
+                            let suffixedPath = @.fs.appendBasename(destPath, "." + fileCode);
+
+                            @.async(function () {
+
+                                if (@.fs.exists.file(suffixedPath)) {
+
+                                    let backupPath = suffixedPath + ".bak." + Date.now();
+
+                                    @.fs.moveFile(suffixedPath, backupPath).then(function () {
+
+                                        zip.extractFile(file, suffixedPath).pipe(this);
+
+                                    }).then(function () {
+
+                                        @.fs.hash.sha1(backupPath).then(function (sha1) {
+                                            @.fs.hash.sha1(suffixedPath).then(function (sha2) {
+
+                                                if (sha1 !== sha2) {
+                                                    this.next(); return;
+                                                }
+
+                                                @.fs.deleteFile(backupPath).pipe(this);
+
+                                            }).pipe(this);
+                                        }).pipe(this);
+
+                                    }).pipe(this);
+
+                                } else {
+                                    zip.extractFile(file, suffixedPath).pipe(this);
+                                }
+
+                            }).then(function () {
+
+                                if (!@.fs.exists(destPath)) {
+                                    this.next();
+                                }
+
+                                let stats = @.fs.fileLStats(destPath);
+                                if (stats.type === "link") {
+                                    @.fs.deleteFile(destPath).pipe(this);
+                                } else {
+                                    let backupPath = destPath + ".bak." + Date.now();
+                                    @.fs.moveFile(destPath, backupPath).pipe(this);
+                                }
+
+                            }).then(function () {
+
+                                @.fs.linkFile(@.fs.filename(suffixedPath), destPath);
+
+                                this.next();
+
+                            }).pipe(this);
+
+                        } else {
+                            zip.extractFile(file, destPath).pipe(this);
+                        }
+
+                        return;
+                    }
+
+                    case "link": { 
+
+                        let link = zip.readLink(file);
+
+                        links.push({
+                            "target": target,
+                            "path": destPath
+                        });
+
+                        this.next();
+
+                        return;
+                    }
+
+                    default: {
+                        throw new Error(`Unknown type of file[${file}]`);
+                    }
+
+                }
+
+            }).then(function () {
+
+                // TODO: make a more suitable solutions
+                for (let record of links) {
+                    @.fs.linkFile(record.target, record.path);
+                }
+
+                this.next();
+
+            }).pipe(this);
+
+        }).then(function () {
+
+            @celebr(`Upgrade of mew_js succeeded, new version[${newCode}]`);
+
+            this.next();
+
+        }).pipe(this);
+
+    }).finished(function (error) {
+
+        if (error) {
+            @error(error);
+            process.exit(1);
+        }
+
+        process.exit();
+
+    });
+
+};
+
+
+if ((switches.mode === "help") || switches.settings.help) {
+    @.task.printHelp(switchesRules);
+    process.exit(0);
+    return;
+}
+
+if ((switches.mode === "version") || switches.settings.version) {
+    @.process.print("mew_ver version 0.1.0");
+    process.exit(0);
+    return;
+}
+
+switch (switches.mode) {
+
+    case "print": { printVersion(switches); break; };
+
+    case "status": { lookupVersions(switches); break; };
+
+    case "upgrade": { upgradeMewJS(switches); break; };
+
+    default: {
+        @error(`Unknown task type ${switches.mode}`);
+        process.exit(1);
+    };
+
+}

@@ -1,0 +1,318 @@
+#!/usr/bin/env mew_js
+
+@.process.mode = "customized";
+
+const switchesRules = {
+    "!defaultTaskMode": "unknown",
+    "!programName": "chan",
+    "!taskModes": {
+        "c": "create", "create": "create",
+        "x": "extract", "extract": "extract",
+        "help": "help",
+        "version": "version",
+    },
+    "!taskHelp": {
+        "prefix": "Program chan targets to help mew_js users to operate on public chan",
+        "modes": {
+            "create": {
+                "text": "Create a new chan file",
+                "command": "chan [c|create] <chan> [<file> ...]"
+            },
+            "extract": {
+                "text": "Extract files from a chan file",
+                "command": "chan [x|extract] <chan> [[<file>] output]"
+            },
+            "help": "Print help text",
+            "version": "Report chan version"
+        },
+        "suffix": "More info is available at https://www.mewchan.com"
+    },
+    "options": {
+        "signerKey": {
+            "!valueType": "string",
+            "!switchText": "RSA private key to sign chan file"
+        },
+        "signerCert": {
+            "!valueType": "string",
+            "!switchText": "RSA public cert to load chan file"
+        },
+        "loadingKey": {
+            "!valueType": "string",
+            "!switchText": "Key to load chan file"
+        },
+        "ignoreDotPrefixedFiles": {
+            "!valueType": "boolean",
+            "!switchText": "Ignore dot prefixed file while packaging",
+            "!defaultValue": true
+        },
+        "excludes": {
+            "!valueType": "array",
+            "!autoresolveArray": "true",
+            "!switchText": "File patterns to exclude while packaging",
+            "!arrayElement": {
+                "!valueType": "string"
+            }
+        }
+    },
+    "settings": {
+        "help": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Force to print help text"
+        },
+        "version": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Force to print mew_chan version text"
+        }
+    }
+};
+
+const switches = @.process.switches(switchesRules);
+
+if ((switches.mode === "help") || switches.settings.help) {
+    @.task.printHelp(switchesRules);
+    process.exit(0);
+    return;
+}
+
+if ((switches.mode === "version") || switches.settings.version) {
+    @.process.print("chan version 1.0.0");
+    process.exit(0);
+    return;
+}
+
+const loadChan = function (path) {
+
+    return @.chan.mount(path, undefined, switches.options.loadingKey, switches.options.signerCert);
+
+};
+
+const createChan = function () {
+
+    if (switches.commands.length === 0) {
+        throw new Error("No chan file provided");
+    }
+
+    const path = @path(switches.commands[0]);
+    let files = switches.commands.slice(1).map((file) => {
+        if (file.slice(-3) === "//*") {
+            return file;
+        }
+        return file + "//*";
+    });
+    if (files.length === 0) {
+        files = undefined;
+    }
+
+    let options = {
+        "ignoreChanBuildingFiles": false,
+        "ignoreDotPrefixedFiles": switches.options.ignoreDotPrefixedFiles,
+        "signerKey": switches.options.signerKey,
+        "publicFiles": [ "//*" ],
+        "resourceFilters": files,
+        "ignoreFilters": switches.options.excludes,
+        "distFile": path
+    };
+
+    @.chan.gen(process.cwd(), undefined, options).finished(function (error) {
+
+        if (error) {
+            @error("Failed to package chan file");
+            @error(error);
+            process.exit(1);
+        }
+
+        @celebr("Resource files has been packaged");
+        process.exit();
+
+    });
+
+};
+
+const guessOutput = function (output) {
+
+    let test = output;
+    let next = 2;
+    while (@.fs.exists(test)) {
+        test = `${output} (${next})`;
+        ++next;
+    }
+
+    return test;
+
+};
+
+const extractChan = function () {
+
+    let path = undefined;
+    let output = undefined;
+    let resource = undefined;
+
+    switch (switches.commands.length) {
+        case 1: {
+            path = @path(switches.commands[0]);
+            break;
+        };
+        case 2: {
+            path = @path(switches.commands[0]);
+            output = @path(switches.commands[1]);
+            break;
+        };
+        case 3: {
+            path = @path(switches.commands[0]);
+            resource = @.fs.posixOSPath(switches.commands[1]);
+            output = @path(switches.commands[2]);
+            break;
+        };
+        default: {
+            @error("Unknown command usage");
+            process.exit(1);
+        };
+    }
+
+    const chan = loadChan(path);
+
+    if (resource && chan.info.resourceMeta[resource]) {
+
+        if (!output) {
+            output = guessOutput(@path(@.fs.filename(resource)));
+            if (!@.fs.exists.dir(output, "..")) {
+                @error("Output path not available");
+                process.exit(1);
+            }
+        } else {
+            if (@.fs.exists.dir(output)) {
+                output = @path(output, @.fs.filename(resource));
+            } else {
+                @.fs.deleteFile(output).pipe(this);
+            }
+        }
+
+        @.async(function () {
+
+            let reader = chan.fs.createReadStream(@path(chan.fs.root, resource));
+            let writer = @.fs.writeFile.stream(output);
+
+            reader.on("error", this.reject.once);
+            writer.on("error", this.reject.once);
+            writer.on("finish", this.next);
+
+            reader.pipe(writer, {
+                "end": true
+            });
+
+        }).finished(function (error) {
+
+            if (error) {
+                @error(error); process.exit(1);
+            }
+
+            @celebr(`Resource ${resource} extracted to ${output}`)
+            process.exit(0);
+
+        });
+
+        return;
+    }
+
+    if (resource && (!chan.info.resourceDirs[resource])) {
+        @error("Resource not found");
+        process.exit(1);
+    }
+
+    if (!output) {
+        output = guessOutput(@path(path, "..", @.fs.basename(path)));
+        @.fs.makeDirs(output);
+    } else {
+        if (!@.fs.exists.dir(output)) {
+            if (@.fs.exists(output)) {
+                @error("Output resource occupied");
+                process.exit(1);
+            }
+            if (!@.fs.exists.dir(output, "..")) {
+                @error("Output path not available");
+                process.exit(1);
+            }
+            @.fs.makeDirs(output);
+        }
+    }
+
+    @.async.all(chan.info.resourceFiles, function (file) {
+
+        if (resource && (file.slice(0, resource.length + 1) !== resource + "/")) {
+            @debug(`Skip resource ${file}`);
+            this.next(); return;
+        }
+
+        let protectedFiles = chan.info.protectedFiles.map((path) => @.as(path, "regex-path"));
+
+        if ((chan.info.resourceMeta[file].fileGroup !== "*") ||
+            (chan.info.resourceMeta[file].filePermissions.indexOf("//*") === -1) ||
+            (protectedFiles.filter(regex => regex.test(file)).length > 0)) {
+            @info(`Skip protected file ${file}`);
+            this.next(); return;
+        }
+
+        const outputPath = @path(output, file);
+
+        @.fs.makeDirs(@.fs.dirname(outputPath));
+
+        @debug(`Extracting resource ${file}`);
+
+        let reader = chan.fs.createReadStream(@path(chan.fs.root, file));
+        let writer = @.fs.writeFile.stream(outputPath);
+
+        reader.on("error", this.reject.once);
+        writer.on("error", this.reject.once);
+        writer.on("finish", this.next);
+
+        reader.pipe(writer, {
+            "end": true
+        });
+
+    }).finished(function (error) {
+
+        if (error) {
+            @error(error); process.exit(1);
+        }
+
+        @celebr(`All resources have been extracted into ${output}`)
+
+        process.exit(0);
+
+    });
+
+};
+
+switch (switches.mode) {
+
+    case "create": { createChan(); break; };
+
+    case "extract": { extractChan(); break; };
+
+    case "unknown": {
+
+        let path = @path(switches.commands[0]);
+        if (@.fs.extname !== ".chan") {
+            @warn("Files without extname `.chan` is not recommended for autodetecting creation or extraction");
+        }
+
+        if (@.fs.exists(path)) {
+            if (!@.fs.exists.file(path)) {
+                @error("Target chan file is not a file");
+                process.exit(1);
+            }
+            createChan();
+        } else {
+            extractChan();
+        }
+
+        break;
+
+    };
+
+    default: {
+        @error(`Unknown task type ${switches.mode}`);
+        process.exit(1);
+    };
+
+}

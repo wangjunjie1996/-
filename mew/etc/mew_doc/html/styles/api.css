@@ -1,0 +1,244 @@
+@charset 'utf-8';
+
+.api {
+}
+
+.api .api-name {
+    font-size: 90%;
+    font-family: 'Mew Source SC', 'Menlo', 'Consolas', monospace;
+}
+
+.api .api-text {
+    font-family: 'Mew Serif SC', 'Times', 'Times New Roman', 'SimSun', serif;
+}
+
+.api-tag {
+    color: #507975;
+    font-family: 'Mew Sans SC', 'PingFang SC', 'Microsoft Yahei', 'Helvetica', 'Arial', sans-serif;
+    margin-right: 4px;
+    margin-bottom: 4px;
+    border-radius: 3px;
+    background-color: #b9e4e0;
+    display: inline-flex;
+    line-height: 1.6;
+    cursor: pointer;
+    position: relative;
+}
+
+.api-tag:after {
+    content: '';
+    background-color: transparent;
+    position: absolute;
+    pointer-events: none;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    right: 0;
+    border-radius: 3px;
+    transition: left 0.2s, top 0.2s, right 0.2s, bottom 0.2s, background-color 0.2s;
+}
+
+.api-tag:hover:after {
+    left: -4px;
+    top: -4px;
+    bottom: -4px;
+    right: -4px;
+    border-radius: 7px;
+    background-color: rgba(0, 212, 194, 0.15);
+}
+
+.api-tag .api-tag-name,
+.api-tag .api-tag-parameter {
+    padding: 0 8px;
+}
+
+.api-tag .api-tag-name {
+    background-color: #74928f;
+    color: #fff;
+    border-radius: 3px;
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+    transition: background-color 0.2s;
+}
+
+.api-tag.api-tag-no-parameter .api-tag-name {
+    border-top-right-radius: 3px;
+    border-bottom-right-radius: 3px;
+}
+
+.api-tag .api-tag-name:hover {
+    background-color: #5c6f6d;
+}
+
+.api-tag .api-tag-parameter {
+    font-size: 13px;
+    font-family: 'Mew Source SC', 'Menlo', 'Consolas', monospace;
+}
+
+.api-alias .api-alias-name,
+.api-related .api-related-name {
+    font-size: 13px;
+    margin-right: 30px;
+    font-family: 'Mew Source SC', 'Menlo', 'Consolas', monospace;
+}
+
+.api-parameter .api-parameter-name,
+.api-result .api-result-name {
+    position: relative;
+    display: inline-block;
+    padding: 2px;
+    color: #2b9cff;
+    font-size: 13px;
+    font-family: 'Mew Source SC', 'Menlo', 'Consolas', monospace;
+    cursor: pointer;
+}
+
+.api-parameter .api-parameter-separator,
+.api-result .api-result-separator {
+    font-size: 13px;
+    font-family: 'Mew Source SC', 'Menlo', 'Consolas', monospace;
+    color: #ddd;
+    font-weight: bold;
+}
+
+.api-alias,
+.api-call,
+.api-parameter,
+.api-result,
+.api-related {
+    margin-bottom: 5px;
+    display: block;
+}
+
+.api-call .api-call-type,
+.api-parameter .api-parameter-name.api-parameter-no-type,
+.api-parameter .api-parameter-type,
+.api-result .api-result-name.api-result-no-type,
+.api-result .api-result-type {
+    margin-right: 30px;
+}
+
+.api-alias .api-alias-tags,
+.api-call .api-call-tags,
+.api-parameter .api-parameter-tags,
+.api-result .api-result-tags {
+    text-indent: 0;
+    margin-right: 16px;
+}
+
+.api-alias .api-alias-texts,
+.api-call .api-call-texts,
+.api-parameter .api-parameter-texts,
+.api-result .api-result-texts {
+    margin-left: 7px;
+    text-indent: 0;
+    border-left: dotted 2px #eee;
+    padding: 3px 0 3px 16px;
+    display: block;
+    margin-top: 10px;
+    margin-bottom: 10px;
+}
+
+.api-alias .api-alias-texts p:first-child,
+.api-call .api-call-texts p:first-child,
+.api-parameter .api-parameter-texts p:first-child,
+.api-result .api-result-texts p:first-child {
+    margin-top: 0;
+}
+
+.api-alias .api-alias-texts p:last-child,
+.api-call .api-call-texts p:last-child,
+.api-parameter .api-parameter-texts p:last-child,
+.api-result .api-result-texts p:last-child {
+    margin-bottom: 0;
+}
+
+.api-parameter .api-parameter-subparameters,
+.api-result .api-result-subparameters {
+    margin-top: 10px;
+}
+
+.api-type {
+    font-size: 13px;
+    font-family: 'Mew Source SC', 'Menlo', 'Consolas', monospace;
+}
+
+.api-type .api-type-name {
+    cursor: pointer;
+    position: relative;
+    padding: 2px;
+    display: inline-block;
+    color: #ff731f;
+    font-weight: bold;
+}
+
+.api-type .api-type-name.api-type-value {
+    color: #2b9cff;
+    font-weight: normal;
+}
+
+.api-type .api-type-name:after,
+.api-parameter .api-parameter-name:after,
+.api-result .api-result-name:after {
+    content: '';
+    pointer-events: none;
+    padding: 4px 20px;
+    margin: -4px -20px;
+    border-radius: 3px;
+    background-color: transparent;
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    transition: background-color 0.2s, padding 0.3s, margin 0.3s;
+}
+
+.api-type .api-type-name:hover:after,
+.api-parameter .api-parameter-name:hover:after,
+.api-result .api-result-name:hover:after {
+    padding: 0 4px;
+    margin: 0 -4px;
+    background-color: rgba(0, 0, 0, 0.2);
+}
+
+.api-type .api-type-operator {
+    color: #bbb;
+    font-weight: bold;
+}
+
+.api-source {
+    font-size: 13px;
+    color: #666;
+    font-family: 'Mew Source SC', 'Menlo', 'Consolas', monospace;
+}
+
+.api-source-separator {
+    color: #ddd;
+}
+
+.api-source-line {
+    color: #bbb;
+}
+
+.api-type .api-type-name.api-type-class-void,
+.api-type .api-type-name.api-type-class-this,
+.api-type .api-type-name.api-type-class-any {
+    font-weight: bold;
+    color: #ff007f;
+    text-transform: lowercase;
+}
+
+.api-type .api-type-name.highlighting:after,
+.api-parameter .api-parameter-name.highlighting:after,
+.api-result .api-result-name.highlighting:after {
+    padding: 0 4px;
+    margin: 0 -4px;
+    background-color: rgba(255, 153, 0, 0.2);
+}
+
+.api-type .api-type-name.highlighting:hover:after,
+.api-parameter .api-parameter-name.highlighting:hover:after,
+.api-result .api-result-name.highlighting:hover:after {
+    background-color: rgba(0, 0, 0, 0.2);
+}

@@ -1,0 +1,4792 @@
+#!/usr/bin/env mew_js
+(function () {
+
+
+    let moduleFilename = module.filename;
+    if (!moduleFilename) {
+        moduleFilename = module.id;
+    }
+
+    const fs = require("fs");
+    const path = require("path");
+    const vm = require("vm");
+
+    const Module = require("module");
+
+    const sep = /[\\\/]+/g;
+
+    const all = {};
+
+    const modules = Object.create(null);
+
+    const resources = Object.create(null);
+
+    const jsFiles = Object.create(null);
+
+    const coreModules = Object.create(null);
+    [
+        "child_process", "cluster", "console", "crypto",
+        "debugger", "dgram", "dns", "domain", "events",
+        "fs", "http", "http2", "https", "inspector", "module",
+        "net", "os", "path", "perf_hooks", "process",
+        "punycode", "querystring", "readline", "repl",
+        "stream", "string_decoder", "timers",
+        "tls", "trace_events", "tty", "url", "util",
+        "vm", "v8", "zlib", "worker_threads",
+        "assert", "buffer", "constants",
+        "mew_util", "mewchan",
+    ].forEach((name) => {
+        coreModules[name] = true;
+    });
+
+    const posixizePath = function (filePath) {
+        return filePath.replace(sep, "/");
+    };
+
+    const isAbsolutePath = function (filePath) {
+        return /^([a-z]:)?[\\\/]/gim.test(filePath);
+    };
+
+    const isUnderDir = function (dirPath, filePath) {
+
+        filePath = posixizePath(filePath);
+        dirPath = posixizePath(dirPath);
+
+        return (filePath.slice(0, dirPath.length + 1) === dirPath + "/");
+
+    };
+
+    const resolveAsCoreModules = function (module, id) {
+        if (coreModules[id]) {
+            return id;
+        }
+    };
+
+    const resolveAsFile = function (module, id) {
+
+        id = path.normalize(id);
+
+        if (isUnderDir(moduleFilename, id)) {
+            let relativeID = posixizePath(path.relative(moduleFilename, id));
+            for (let extname of ["", ".js", ".json"]) {
+                if (jsFiles[relativeID + extname]) {
+                    return id + extname;
+                }
+            }
+            return;
+        }
+
+        for (let extname of [""].concat(Object.keys(Module._extensions))) {
+            let file = id + extname;
+            if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+                return fs.realpathSync(file);
+            }
+        }
+
+    };
+
+    const resolveAsDirectory = function (module, id) {
+
+        let mainID = undefined;
+
+        if (isUnderDir(moduleFilename, id)) {
+            const relativeID = posixizePath(path.relative(moduleFilename, id));
+            if (jsFiles[relativeID + "/package.json"]) {
+                try {
+                  mainID = evaluate(id + "/package.json").main;
+                } catch (error) {}
+                if (mainID) {
+                    mainID = path.normalize(path.join(id, mainID));
+                }
+            }
+        } else {
+            if (fs.existsSync(id + "/package.json")) {
+                try {
+                    mainID = JSON.parse(fs.readFileSync(id + "/package.json").toString("utf8")).main;
+                } catch (error) {}
+                if (mainID) {
+                    mainID = path.normalize(path.join(id, mainJS));
+                }
+            }
+        }
+
+        if (mainID) {
+            let resolved = resolveAsFile(module, mainID);
+            if (resolved) {
+                return resolved;
+            }
+        }
+
+        let resolved = resolveAsFile(module, id + "/index");
+        if (resolved) {
+            return resolved;
+        }
+
+    };
+
+    const resolveAsNodeModules = function (module, id) {
+
+        for (let node of module.paths) {
+
+            let resolved = resolveAsFile(module, path.join(node, id));
+            if (resolved) {
+                return resolved;
+            }
+
+            resolved = resolveAsDirectory(module, path.join(node, id));
+            if (resolved) {
+                return resolved;
+            }
+
+        }
+
+    };
+
+    const resolve = function (module, id) {
+
+        let filename = module.filename;
+        if (!filename) {
+            filename = module.id;
+        }
+
+        if (id.length === 0) {
+            id = module ? filename : moduleFilename;
+        } else if (/^\.(\.?)[\/\\]/.test(id)) {
+            if (filename === moduleFilename) {
+                id = path.normalize(path.join(filename, id));
+            } else {
+                id = path.normalize(path.join(filename, "..", id));
+            }
+        } else {
+            id = path.normalize(id);
+        }
+
+        if ((id === moduleFilename) ||
+            ((!isAbsolutePath(moduleFilename)) && isUnderDir(moduleFilename, id))) {
+            return id;
+        }
+
+        const basename = path.basename(id);
+
+        let newID = resolveAsCoreModules(module, id);
+        if (newID) { return newID; }
+
+        if (isAbsolutePath(id)) {
+            newID = resolveAsFile(module, id);
+            if (newID) {
+                return newID;
+            }
+            return resolveAsDirectory(module, id);
+        }
+
+        return resolveAsNodeModules(module, id);
+
+    };
+
+    let readFile = fs.readFile;
+    let readFileSync = fs.readFileSync;
+
+    const innerFS = new Proxy(fs, {
+        "get": function (target, key, receiver) {
+            // We only support read file for inner resources
+            if (key === "readFile") {
+                return function (file) {
+                    let options = undefined;
+                    let callback = undefined;
+                    switch (arguments.length) {
+                        case 2: { callback = arguments[1]; break; };
+                        case 3: { options = arguments[1]; callback = arguments[2]; break; };
+                    }
+                    if (!isAbsolutePath(file)) {
+                        file = path.join(process.cwd(), file);
+                    }
+                    if (!isUnderDir(moduleFilename, file)) {
+                        return readFile.apply(fs, arguments);
+                    }
+                    let relative = posixizePath(path.relative(moduleFilename, file));
+                    let content = resources[relative];
+                    if (content === undefined) {
+                        process.nextTick(() => callback(new Error("File not found")));
+                        return;
+                    }
+                    if (options && (typeof options === "string")) {
+                        content = content.toString(options);
+                    } else if (options && options.encoding) {
+                        content = content.toString(options.encoding);
+                    }
+                    process.nextTick(() => callback(undefined, content));
+                };
+            } else if (key === "readFileSync") {
+                return function (file, options) {
+                    if (!isAbsolutePath(file)) {
+                        file = path.join(process.cwd(), file);
+                    }
+                    if (!isUnderDir(moduleFilename, file)) {
+                        return readFileSync(file);
+                    }
+                    let relative = posixizePath(path.relative(moduleFilename, file));
+                    let content = resources[relative];
+                    if (content === undefined) {
+                        throw new Error("File not found");
+                    }
+                    if (options && (typeof options === "string")) {
+                        content = content.toString(options);
+                    } else if (options && options.encoding) {
+                        content = content.toString(options.encoding);
+                    }
+                    return content;
+                };
+            }
+            return fs[key];
+        }
+    });
+
+    const evaluate = function (id) {
+
+        if (id === "fs") {
+            return innerFS;
+        }
+
+        const origin = id;
+
+        id = resolve(module, id);
+
+        if (!id) {
+            throw new Error(`Module[${JSON.stringify(origin)}] not found`);
+        }
+
+        if (!isUnderDir(moduleFilename, id)) {
+            return Module.prototype.require.call(module, id);
+        }
+
+        let relativeID = posixizePath(path.relative(moduleFilename, id));
+
+        let basename = path.basename(relativeID);
+
+        let extname = path.extname(relativeID);
+        if ((extname !== ".js") && (extname !== ".json")) {
+            throw new Error("Unsupported module extension in combined script");
+        }
+
+        let cache = modules[relativeID];
+        if (cache) {
+            return cache.exports;
+        }
+
+        if (!jsFiles[relativeID]) {
+            throw new Error("File not found");
+        }
+
+        let sandbox = {};
+
+        sandbox.require = function (id) {
+            let newID = resolve(sandbox, id);
+            if (newID) {
+                return evaluate(newID);
+            } else {
+                throw new Error("Can't find module " + id);
+            }
+        };
+
+        sandbox.require.extensions = Module._extensions;
+        sandbox.require.main = process.mainModule;
+
+        sandbox.require.resolve = function (id) {
+            return resolve(sandbox, id);
+        };
+
+        sandbox.exports = {};
+        sandbox.paths = Module._nodeModulePaths(path.dirname(id));
+
+        sandbox.filename = id;
+
+        sandbox.module = sandbox;
+
+        modules[relativeID] = sandbox;
+
+        let lineOffset = 0;
+        let script = jsFiles[relativeID].toString();
+
+        let uglified = (script.split(/\r|\n|\r\n/)[0] != "function (module, exports, require, __dirname, __filename, __exports) {");
+        if (!uglified) {
+            lineOffset = 2;
+        }
+
+        script = `(${script})(module, exports, require, __dirname, __filename, exports)`;
+
+        vm.runInThisContext(Module.wrap(script), {
+            "filename": id,
+            "lineOffset": lineOffset,
+            "displayErrors": true
+        }).call(sandbox.exports, sandbox.exports, sandbox.require, sandbox, id, path.dirname(id));
+
+        return sandbox.exports;
+
+    };
+
+
+    jsFiles["src/index.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        @.process.mode = "customized";
+        
+        const fs = require("fs");
+        
+        const switchesRules = {
+            "!programName": "hako",
+            "!taskModes": {
+        
+                "cmd": "command", "command": "command",
+        
+                "init": "initial", "initial": "initial",
+        
+                "monitor": "manager", "manager": "manager",
+        
+                "run": "mew", "mew": "mew",
+        
+                "exec": "execute", "execute": "execute",
+        
+                "daemon": "daemon",
+        
+                "start": "start",
+        
+                "list": "status", "status": "status",
+        
+                "kill": "stop", "stop": "stop",
+                "restart": "restart",
+        
+                "shutdown": "shutdown",
+        
+                "upgrade": "upgrade",
+                "dev": "watch", "develop": "watch", "watch": "watch",
+        
+                "kitty": "kitty",
+                "for-each-kitty": "for-each-kitty",
+        
+                "help": "help",
+                "version": "version"
+        
+            },
+            "!taskHelp": {
+                "prefix": "Program hako targets to help mew_js users to manage mewchan\nruntime with more flexibility",
+                "modes": {
+                    "command": {
+                        "text": "Execute a hako command in the lib dir",
+                        "command": "hako cmd|command <name>"
+                    },
+                    "initial": {
+                        "text": "Initial a hako mewchan file layouts",
+                        "command": "hako init|initial"
+                    },
+                    "manager": {
+                        "text": "Start a manager process as monitor of mewchan in hakos",
+                        "command": "hako monitor|manager"
+                    },
+                    "shutdown": {
+                        "text": "Shutdown manager and all its hakos",
+                        "command": "hako shutdown"
+                    },
+                    "mew": {
+                        "text": "Start a mewchan",
+                        "command": "hako [run|mew] [<path>]"
+                    },
+                    "execute": {
+                        "text": "Start an execution as a background task by manager",
+                        "command": "hako exec|execute - <command>"
+                    },
+                    "for-each-kitty": {
+                        "text": "Start an execution to each kitty in mewchan. (deprecated)",
+                        "command": "hako for-each-kitty - <command>"
+                    },
+                    "daemon": {
+                        "text": "Start manager as a background daemon task",
+                        "command": "hako daemon"
+                    },
+                    "start": {
+                        "text": "Start a mewchan as a background task by manager",
+                        "command": "hako start [<path>]"
+                    },
+                    "status": {
+                        "text": "List all hakos",
+                        "command": "hako status|list"
+                    },
+                    "restart": {
+                        "text": "Restart a hako mewchan",
+                        "command": "hako restart [<path>|<id>|<pid>]"
+                    },
+                    "stop": {
+                        "text": "Stop a hako mewchan",
+                        "command": "hako kill|stop [<path>|<id>|<pid>]"
+                    },
+                    "upgrade": {
+                        "text": "Upgrade hako command",
+                        "command": "hako update|upgrade"
+                    },
+                    "watch": {
+                        "text": "Watch file changes and autorestart",
+                        "command": "hako watch|dev|develop"
+                    },
+                    "kitty": {
+                        "text": "Execute kitty related commands",
+                        "command": "hako kitty init|info|list|for-each"
+                    },
+                    "other": {
+                        "text": "Execute installed extra hako commands",
+                        "command": "hako <command>"
+                    },
+                    "help": "Print help text",
+                    "version": "Report hako version"
+                },
+                "suffix": "More info is available at https://www.mewchan.com",
+                "examples": [
+                    {
+                        "command": "hako watch  --debug",
+                        "text": "Start mewchan and autorestart if any files changed \nin debug mode"
+                    },
+                    {
+                        "command": "hako restart abc",
+                        "text": "Restart any hako which ID contains `abc`"
+                    },
+                    {
+                        "command": "hako daemon",
+                        "text": "Start hako manager if not available"
+                    },
+                    {
+                        "command": "hako start --usage=abc --hako-json=conf/hako.abc.json",
+                        "text": "Start hako using configs in `conf/hako.abc.json` \nwith `abc` suffix"
+                    },
+                    {
+                        "command": "hako start --autorestart",
+                        "text": "Start hako and keep it always running"
+                    },
+                    {
+                        "command": "hako start --restart",
+                        "text": "Start hako or restart it if already running"
+                    },
+                    {
+                        "command": "hako status",
+                        "text": "List all hakos managed by manager"
+                    },
+                    {
+                        "command": "hako kitty info abc",
+                        "text": "Show all informations for kitty[abc] or kitty[abc.*]"
+                    },
+                    {
+                        "command": "hako kitty info . abc.def",
+                        "text": "Show all informations for kitty[abc.def] under \ncurrent directory"
+                    },
+                    {
+                        "command": "hako kitty list",
+                        "text": "List all kitties under configurations `hako.json` \nand `mewchan.json`"
+                    },
+                    {
+                        "command": "hako kitty for-each - npm install",
+                        "text": "Run npm install under every kitty folders \nconfigured"
+                    },
+                    {
+                        "command": "hako kitty check",
+                        "text": "Check all kitties enabled"
+                    }
+                ]
+            },
+            "options": {
+            },
+            "settings": {
+                "debug": {
+                    "!valueType": "boolean", "!defaultValue": false,
+                    "!switchText": "Force to run in debug mode"
+                },
+                "presets": {
+                    "!valueType": "array", "!autoresolveArray": true,
+                    "!operation": "union",
+                    "!defaultValue": [],
+                    "!arrayElement": { "!valueType": "string" },
+                    "!switchText": "Presets to load mewchan configs"
+                },
+                "homePath": {
+                    "!valueType": "string",
+                    "!switchText": "Home path for hako to run"
+                },
+                "restart": {
+                    "!valueType": "boolean", "!defaultValue": true,
+                    "!switchText": "Force to restart hako if already online in start \ncommand"
+                },
+                "autorestart": {
+                    "!valueType": "boolean", "!defaultValue": false,
+                    "!switchText": "Autorestart hako if it was offline"
+                },
+                "usage": {
+                    "!valueType": "string",
+                    "!switchText": "Usage of the hako, as the suffix of hako ID"
+                },
+                "watchDotFiles": {
+                    "!valueType": "boolean", "!defaultValue": false,
+                    "!switchText": "Autorestart mewchan if dot prefixed file changed \nin watch mode"
+                },
+                "watchExtnames": {
+                    "!valueType": "array", "!autoresolveArray": true,
+                    "!operation": "union",
+                    "!arrayElement": { "!valueType": "string" },
+                    "!switchText": "Autorestart mewchan if file with extname specified \nchanged in watch mode"
+                },
+                "noWatchJSExtnames": {
+                    "!valueType": "boolean", "!defaultValue": false,
+                    "!switchText": "Remove default JS extnames `.js` and `.json` from \nwatch file extnames"
+                },
+                "hakoJSON": {
+                    "!valueType": "array",
+                    "!elementType": "string",
+                    "!autoresolveArray": true,
+                    "!operation": "union",
+                    "!switchText": "Location of `hako.json` file for mewchan options"
+                },
+                "mewDoc": {
+                    "!valueType": "boolean", "!defaultValue": false,
+                    "!switchText": "Initial hako dir with mew_doc support"
+                },
+                "target": {
+                    "!valueType": "string", "!defaultValue": "default",
+                    "!switchText": "The target to initialize hako dir"
+                },
+                "allKitties": {
+                    "!valueType": "boolean", "!defaultValue": false,
+                    "!switchText": "List or executing commands for all kitties"
+                },
+                "help": {
+                    "!valueType": "boolean", "!defaultValue": false,
+                    "!switchText": "Force to print help text"
+                },
+                "version": {
+                    "!valueType": "boolean", "!defaultValue": false,
+                    "!switchText": "Force to print mew_chan version text"
+                }
+            }
+        };
+        
+        const abbreviations = ["json", "js"];
+        
+        const switches = @.process.switches(switchesRules, abbreviations);
+        
+        if ((switches.mode === "help") || switches.settings.help) {
+            @.task.printHelp(switchesRules, abbreviations);
+            process.exit(0);
+            return;
+        }
+        
+        if ((switches.mode === "version") || switches.settings.version) {
+        
+            var versionJSON;
+        
+            try {
+                versionJSON = JSON.parse(fs.readFileSync(@path(__dirname, "../dist/upgrade/version.json")).toString("utf-8"));
+            } catch (ex) {
+                versionJSON = JSON.parse(fs.readFileSync(@path(__dirname, "../etc/upgrade/version.json")).toString("utf-8"));
+            }
+        
+            @.process.print("hako version " + versionJSON.version);
+            process.exit(0);
+            return;
+        }
+        
+        if (!switches.settings.homePath) {
+            switches.settings.homePath = @.fs.homePath(".hako");
+        }
+        switches.settings.homePath = @path(switches.settings.homePath);
+        
+        let mode = switches.mode;
+        if ((!mode) &&
+            ((switches.commands.length === 0) ||
+             (!@.fs.exists(@path(switches.settings.homePath, "cmd", switches.commands[0] + ".chan"))))) {
+            mode = "mew";
+        }
+        
+        switch (mode) {
+        
+            case "daemon":
+            case "shutdown":
+            case "manager":
+        
+            case "status":
+        
+            case "initial":
+        
+            case "start":
+            case "restart":
+            case "stop":
+        
+            case "execute":
+        
+            case "mew":
+            case "upgrade" :
+            case "kitty":
+            case "watch" : 
+            case "for-each-kitty": {
+        
+                require(`../src/cmd/${mode}.js`).command(switches).rejected(function (error) {
+                    @error(error);
+                    process.exit(1);
+                });
+        
+                break;
+            };
+        
+            default: {
+        
+                let commandPath = @path(switches.settings.homePath, "cmd", switches.commands[0] + ".chan");
+                if (!@.fs.exists(commandPath)) {
+                    @error("Invalid hako command");
+                    process.exit(1);
+                }
+        
+                const command = @.chan.mount(commandPath).require();
+                if ((typeof command !== "function") && (typeof command.command === "function")) {
+                    command = command.command;
+                }
+        
+                if (typeof command !== "function") {
+                    @error("Invalid hako command");
+                    process.exit(1);
+                }
+        
+                @.async(function () {
+        
+                    command(switches).pipe(this);
+        
+                }).then(function () {
+        
+                    process.exit(0);
+        
+                    this.next();
+        
+                }).rejected(function (error) {
+        
+                    @error(error);
+        
+                    process.exit(1);
+        
+                });
+        
+                break;
+            };
+        
+        }
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/command.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/daemon.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const fs = require("fs");
+        
+        const { connectManager } = require("../lib/manager.js");
+        
+        const { ensureHakoDaemon } = require("../lib/daemon.js");
+        
+        /**
+         * [命令] 尝试后台启动Hako管理工具
+         * @function <command.daemon>
+         */
+        const startHakoDaemon = function (switches) {
+        
+            let homePath = switches.settings.homePath;
+        
+            if (!@.fs.exists.dir(homePath)) {
+                if (@.fs.exists(homePath)) {
+                    @error(`Home path is not a dir ${homePath}`);
+                }
+                @.fs.makeDirs(homePath);
+            }
+        
+            return ensureHakoDaemon(switches).then(function (notFoundError, connectError, url, pid) {
+        
+                if (!notFoundError) {
+                    @info(`Manager[${pid}] has already started: ${url}`);
+                    process.exit(0);
+                }
+        
+                if (connectError) {
+                    @warn(`Hako manager[${pid}](No Responding) has been started at: ${url}`);
+                } else {
+                    @celebr(`Hako manager[${pid}] has been started at: ${url}`);
+                }
+        
+                process.exit(0);
+        
+            });
+        
+        };
+        
+        module.exports.command = startHakoDaemon
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/execute.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const { connectManager } = require("../lib/manager.js");
+        
+        /**
+         * [命令] 尝试后台启动额外自定义命令的Hako
+         * @function <command.execute>
+         */
+        const executeCommand = function (switches) {
+        
+            let homePath = switches.settings.homePath;
+        
+            if (switches.rests.length === 0) {
+                return @.async.reject(new Error("No commands provided to execute"));
+            }
+        
+            return @.async(function () {
+        
+                connectManager(homePath).catch(this);
+        
+            }).then(function (notFoundError, connectError, url, pid) {
+        
+                if (notFoundError) {
+                    @error(`Hako manager not started with home path: ${homePath}`);
+                    process.exit(1);
+                }
+        
+                if (connectError) {
+                    @error(`Manager[${pid}](No Responding): ${url}`);
+                    process.exit(1);
+                }
+        
+                @.net.httpClient().request(url + "/start", {
+                    "method": "POST",
+                    "dataType": "json",
+                    "data": JSON.stringify({
+                        "type": "execute",
+                        "path": process.cwd(),
+                        "usage": switches.settings.usage,
+                        "restart": switches.settings.restart,
+                        "settings": {
+                            "env": Object.assign({}, process.env),
+                            "autorestart": switches.settings.autorestart,
+                            "execution": switches.rests,
+                        }
+                    }),
+                    "onSuccess": (result) => {
+        
+                        if (result.error) {
+                            @error(`Failed to start hako: ${result.error}`);
+                            process.exit(1);
+                        }
+        
+                        @celebr(`Hako[${result.id}] has been started with PID[${result.pid}]`);
+                        process.exit(0);
+        
+                    },
+                    "onError": (error) => {
+                        @error("Failed to start hako");
+                        @error(error);
+                        process.exit(1);
+                    }
+                });
+        
+            });
+        
+        };
+        
+        module.exports.command = executeCommand
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/for-each-kitty.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const { forEachKitty } = require("./kitty.js");
+        
+        module.exports.command = function (switches) {
+        
+            @warn("Mode[for-each-kitty] is deprecated, please use `hako kitty for-each`");
+        
+            return forEachKitty(switches);
+        
+        }
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/initial.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const fs = require("fs");
+        
+        const templates = Object.create(null);
+        
+        templates["default"] = {
+            "dirs": [ "bot", "brain", "conf", "kitties", "ui" ],
+            "files": [
+                "bot/default.js",
+                "brain/index.js",
+                "conf/chan.json",
+                "conf/hako.json",
+                "conf/mewchan.json",
+                "ui/index.mhtml",
+                ["gitignore", ".gitignore"],
+                ["hakoignore", ".hakoignore"]
+            ]
+        };
+        
+        templates["command"] = {
+            "dirs": [ "bot", "src" ],
+            "files": [
+                ["bot/default.command.js", "bot/default.js"],
+                ["conf/chan.command.js", "conf/chan.js"],
+                "src/index.js",
+                "package.json",
+                ["gitignore", ".gitignore"],
+                ["hakoignore", ".hakoignore"],
+            ]
+        };
+        
+        const initialHakoFiles = function (switches) {
+        
+            let target = switches.settings.target;
+            if (!templates[target]) {
+                return @.async.reject(new Error("Invalid init target"));
+            }
+        
+            let path = process.cwd();
+        
+            return @.async(function () {
+        
+                let dirs = templates[target].dirs.slice(0);
+                let files = templates[target].files.slice(0);
+        
+                if (switches.settings.apidoc) {
+                    files.push("bot/apidoc.js");
+                }
+        
+                if (switches.settings.mewDoc) {
+                    files.push("bot/doc.js");
+                    files.push("conf/doc.json");
+                }
+        
+                for (let dir of dirs) {
+                    @.fs.makeDirs(@path(path, dir));
+                }
+        
+                for (let file of files) {
+        
+                    let source = file;
+                    if (source instanceof Array) {
+                        source = source[0];
+                    }
+        
+                    let dest = file;
+                    if (dest instanceof Array) {
+                        dest = dest[1]
+                    }
+                    dest = @.format(dest, {
+                        "name": (@.fs.filename(path)),
+                        "user": process.env.USERNAME ? process.env.USERNAME : process.env.USER
+                    });
+        
+                    if (!@.fs.exists(path, dest)) {
+        
+                        @debug(`Generating file ${dest}`);
+        
+                        let content = fs.readFileSync(@path(__dirname, "../../etc/hako/init", source)).toString("utf8");
+        
+                        content = @.format(content, {
+                            "name": (@.fs.filename(path)),
+                            "user": process.env.USERNAME ? process.env.USERNAME : process.env.USER
+                        }, {
+                            "parser": "text/mxml"
+                        });
+        
+                        @.fs.writeFile.sync(@path(path, dest), content);
+        
+                    } else {
+                        @warn(`Ignore existing file ${dest}`);
+                    }
+        
+                }
+        
+                @celebr("All files has been generated");
+        
+                process.exit();
+        
+            });
+        
+        };
+        
+        module.exports.command = initialHakoFiles
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/kitty.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const { executeShell } = require("../lib/process.js");
+        const { resolveMewchanJSON } = require("../lib/mewchan.js");
+        
+        const ignorableMewchanPathCommands = Object.create(null);
+        ignorableMewchanPathCommands["info"] = true;
+        ignorableMewchanPathCommands["init"] = true;
+        ignorableMewchanPathCommands["check"] = true;
+        ignorableMewchanPathCommands["exec"] = true;
+        
+        const resolveMewchanPath = function (switches) {
+        
+            let ignoredMewchanPath = false;
+            let path = switches.commands[1];
+            if (path && (!@.fs.exists(path)) && ignorableMewchanPathCommands[switches.commands[0]]) {
+                path = undefined;
+            }
+            if (!path) {
+                ignoredMewchanPath = true;
+                path = process.cwd();
+            }
+        
+            path = @path(path);
+        
+            return {
+                "path": path,
+                "ignoredMewchanPath": ignoredMewchanPath
+            };
+        
+        };
+        
+        const resolveKittyFactoryInfo = function (path, factory, handler) {
+        
+            if (!handler.fs.existsSync(path)) {
+                return @.async.resolve({});
+            }
+        
+            let kittyPath = @path(handler.fs.root, "kitties", factory);
+        
+            if (!handler.fs.existsSync(kittyPath)) {
+                return @.async.reject(new Error(`Kitty[${factory}] not found`));
+            }
+        
+            let packageJSONPaths = [];
+            if (handler.fs.existsSync(@path(kittyPath, "package-lock.json"))) {
+                packageJSONPaths.push(@path(kittyPath, "package-lock.json"));
+            }
+            if (handler.fs.existsSync(@path(kittyPath, "package.json"))) {
+                packageJSONPaths.push(@path(kittyPath, "package.json"));
+            }
+        
+            let modules = Object.create(null);
+        
+            let packageInfo = {};
+        
+            for (let packageJSONPath of packageJSONPaths) {
+        
+                let json = undefined;
+                try {
+                    json = handler.require(packageJSONPath);
+                } catch (error) {
+                    @error(`Failed to parse package json file ${packageJSONPath}`);
+                }
+        
+                if (json) {
+        
+                    if (json.description) { packageInfo.description = json.description; }
+                    if (json.version) { packageInfo.version = json.version; }
+        
+                    if (json.author) { packageInfo.author = json.author; }
+                    if (json.website) { packageInfo.website = json.website; }
+                    if (json.company) { packageInfo.company = json.company; }
+        
+                    for (let key in json.dependencies) {
+                        let version = json.dependencies[key];
+                        if (typeof version !== "string") {
+                            version = version.version;
+                        }
+                        if (version && (!modules[key])) {
+                            modules[key] = {
+                                "version": version,
+                                "installed": (handler.fs.existsSync(@path(kittyPath, "node_modules", key)))
+                            };
+                        }
+                    }
+                }
+        
+            }
+        
+            let kittyJSON = {};
+            if (handler.fs.existsSync(@path(kittyPath, "kitty.json"))) {
+                try {
+                    kittyJSON = handler.require(@path(kittyPath, "kitty.json"));
+                } catch (error) {
+                    @error(`Failed to parse ${@path(kittyPath, "kitty.json")}`);
+                }
+            }
+        
+            return @.async(function () {
+        
+                let autoload = kittyJSON.autoload || (kittyJSON.autoload === undefined) ? true : false;
+        
+                this.next({
+                    "modules": modules,
+                    "factory": factory,
+                    "author": kittyJSON.author ? kittyJSON.author : packageInfo.author,
+                    "domain": kittyJSON.domain,
+                    "description": kittyJSON.description ? kittyJSON.description : packageInfo.description,
+                    "version": kittyJSON.version ? kittyJSON.version : packageInfo.version,
+                    "company": kittyJSON.company ? kittyJSON.company : packageInfo.company,
+                    "website": kittyJSON.website ? kittyJSON.website : packageInfo.website,
+                    "autoload": autoload,
+                    "mainFile": (!autoload) ? (kittyJSON.mainFile ? kittyJSON.mainFile : "index.js") : undefined,
+                    "options": kittyJSON.options
+                });
+        
+            });
+        
+        };
+        
+        const initKitty = function (switches) {
+        
+            let { path, ignoredMewchanPath } = resolveMewchanPath(switches);
+        
+            return @.async(function () {
+        
+                let kitty = ignoredMewchanPath ? switches.commands[1] : switches.commands[2];
+        
+                if (/[\.\/:\?\*\\]/.test(kitty)) {
+                    throw new Error(`Invalid kitty name[${kitty}]`);
+                }
+        
+                let kittyPath = @path(path, "kitties", kitty);
+        
+                if (@.fs.exists(kittyPath)) {
+                    throw new Error(`Kitty[${kitty}] already defined`);
+                }
+        
+                @.fs.makeDirs(kittyPath);
+        
+                @info(`Writing file kitties/${kitty}/index.js`);
+                @.fs.writeFile.sync(@path(kittyPath, "index.js"), `@celebr(\"Kitty ${kitty} started\");\n`);
+        
+                @info(`Writing file kitties/${kitty}/kitty.json`);
+                @.fs.writeFile.sync(@path(kittyPath, "kitty.json"), JSON.stringify({
+                    "author": process.env.USERNAME ? process.env.USERNAME : process.env.USER,
+                    "version": "0.1.0",
+                    "autoload": true,
+                    "options": {
+                        "!valueType": "object",
+                        "!defaultValue": {}
+                    }
+                }, null, 4));
+        
+                @celebr(`All files needed for kitty[${kitty}] has been created`);
+        
+                @warn("Don't forget updating `mewchan.json` or `hako.json` to enable new kitties");
+        
+                this.next();
+        
+            }).finished(function (error) {
+        
+                if (error) {
+                    @error(error);
+                    process.exit(1);
+                    return;
+                }
+        
+                process.exit(0);
+        
+            });
+        
+        };
+        
+        const forEachKitty = function (switches) {
+        
+            let { path, ignoredMewchanPath } = resolveMewchanPath(switches);
+        
+            return resolveMewchanJSON(switches, path).then(function (kitties, factories, json, hakoJSON, usage) {
+        
+                @.async.all(@.keys(factories), function (factory) {
+        
+                    let kittyPath = @path(path, "kitties", factory);
+        
+                    @info(`Kitty[${factory}]: Executing command [${switches.rests.join(" ")}]`);
+        
+                    @.async(function () {
+        
+                        executeShell(switches.rests[0], switches.rests.slice(1), kittyPath, process.env).catch(this);
+        
+                    }).then(function (error) {
+        
+                        if (error) {
+                            @error(error);
+                        }
+        
+                        this.next();
+        
+                    }).pipe(this);
+        
+                }).pipe(this);
+        
+            }).finished(function (error) {
+        
+                if (error) {
+                    @error(error);
+                    process.exit(1);
+                    return;
+                }
+        
+                process.exit(0);
+        
+            });
+        
+        };
+        
+        const listKitties = function (switches) {
+        
+            let { path, ignoredMewchanPath } = resolveMewchanPath(switches);
+        
+            return resolveMewchanJSON(switches, path).then(function (kitties, factories, json, hakoJSON, usage) {
+        
+                let availables = 0;
+                for (let kitty of kitties) {
+                    if (json.kitties[kitty]) {
+                        ++availables;
+                    }
+                }
+        
+                if (availables === kitties.length) {
+                    @.process.print(`${@.term.text("\nKitties enabled(" + availables + "):", ["white", "bold"])}`);
+                } else {
+                    @.process.print(`${@.term.text("\nKitties enabled(" + availables + "/" + kitties.length + "):", ["white", "bold"])}`);
+                }
+                @.process.print.dash();
+        
+                for (let kitty of kitties) {
+                    let config = json.kitties[kitty];
+                    if (config) {
+                        @.process.print(`    ${@.term.text(kitty, "yellow")}: ${@.term.text("enabled", "green")}`);
+                    } else {
+                        @.process.print(`    ${@.term.text(kitty, "yellow")}: ${@.term.text("not enabled", "red")}`);
+                    }
+                }
+        
+                @.process.print();
+        
+                this.next();
+        
+            }).finished(function (error) {
+        
+                if (error) {
+                    @error(error);
+                    process.exit(1);
+                    return;
+                }
+        
+                process.exit(0);
+        
+            });
+        
+        };
+        
+        const checkKitties = function (switches) {
+        
+            let hasErrors = false;
+        
+            let { path, ignoredMewchanPath } = resolveMewchanPath(switches);
+        
+            return resolveMewchanJSON(switches, path).then(function (kitties, factories, json, hakoJSON, usage, handler) {
+        
+                let specifiedKitty = undefined;
+                if (ignoredMewchanPath) {
+                    specifiedKitty = switches.commands[1];
+                } else {
+                    specifiedKitty = switches.commands[2];
+                }
+        
+                @.async.all(kitties, function (kitty) {
+        
+                    if (specifiedKitty &&
+                        (specifiedKitty !== kitty) &&
+                        (specifiedKitty !== kitty.split(".")[0])) {
+                        this.next();
+                        return;
+                    }
+        
+                    @.async(function () {
+        
+                        @info(`Checking kitty[${kitty}]`);
+        
+                        resolveKittyFactoryInfo(path, kitty.split(".")[0], handler).then(function (info) {
+        
+                            if (info.modules && (Object.keys(info.modules).length > 0)) {
+                                for (let key in info.modules) {
+                                    if (!info.modules[key].installed) {
+                                        hasErrors = true;
+                                        @error(`Module[${key}] of kitty[${kitty}] not installed`);
+                                    }
+                                }
+                            }
+        
+                            this.next();
+        
+                        }).catch(this);
+        
+                    }).then(function (error) {
+        
+                        if (error) {
+                            @error(error);
+                        }
+        
+                        this.next();
+        
+                    }).pipe(this);
+        
+                }).pipe(this);
+        
+            }).then(function () {
+        
+                if (hasErrors) {
+                    @error("Not all kitties working correctly");
+                    process.exit(1);
+                    return;
+                }
+        
+                @celebr("All kitties checked OK");
+                this.next();
+        
+            }).finished(function (error) {
+        
+                if (error) {
+                    @error(error);
+                    process.exit(1);
+                    return;
+                }
+        
+                process.exit(0);
+        
+            });
+        
+        };
+        
+        const showKittyInfo = function (switches) {
+        
+            let { path, ignoredMewchanPath } = resolveMewchanPath(switches);
+        
+            return resolveMewchanJSON(switches, path).then(function (kitties, factories, json, hakoJSON, usage, handler) {
+        
+                let kitty = undefined;
+                if (ignoredMewchanPath) {
+                    kitty = switches.commands[1];
+                } else {
+                    kitty = switches.commands[2];
+                }
+        
+                if (!kitty) {
+                    throw new Error("Missing kitty name");
+                }
+        
+                resolveKittyFactoryInfo(path, kitty.split(".")[0], handler).then(function (info) {
+        
+                    @.process.print(`\n${@.term.text("Kitty info:", ["white", "bold"])}`);
+                    @.process.print.dash();
+        
+                    for (let key of [
+                         "factory",
+                         "domain",
+                         "description", "version",
+                         "author", "company", "website",
+                         "autoload", "mainFile"]) {
+                        if (info[key] !== undefined) {
+                            if (typeof info[key] === "boolean") {
+                                @.process.print(`    ${@.term.text(key[0].toUpperCase() + key.slice(1), "yellow")}: ${@.term.text(info[key] ? "yes" : "no", "cyan")}`);
+                            } else {
+                                @.process.print(`    ${@.term.text(key[0].toUpperCase() + key.slice(1), "yellow")}: ${@.term.text(info[key], "cyan")}`);
+                            }
+                        }
+                    }
+        
+                    if (info.options) {
+                        let hasOptions = false;
+                        for (let key in info.options) {
+                            if (key[0] !== "!") {
+                                if (!hasOptions) {
+                                    hasOptions = true;
+                                    @.process.print(`\n${@.term.text("Kitty options:", ["white", "bold"])}`);
+                                    @.process.print.dash();
+                                }
+                                // let defaultValue = info.options[key]["!defaultValue"];
+                                let valueType = info.options[key]["!valueType"];
+                                @.process.print(`    ${@.term.text(key, "yellow")}: ${@.term.text(valueType, "cyan")}`);
+                            }
+                        }
+                    }
+        
+                    if (info.modules && (Object.keys(info.modules).length > 0)) {
+                        @.process.print(`\n${@.term.text("Node modules(" + Object.keys(info.modules).length + "):", ["white", "bold"])}`);
+                        @.process.print.dash();
+                        for (let key in info.modules) {
+                            @.process.print(`    ${@.term.text(key, "yellow")}[${info.modules[key].version}]: ${info.modules[key].installed ? @.term.text("installed", "green") : @.term.text("not installed", "red")}`);
+                        }
+                    }
+        
+                    let hasKitties = 0;
+                    for (let key in json.kitties) {
+                        if ((key.split(".")[0] === kitty) || (key === kitty)) {
+                            ++hasKitties;
+                        }
+                    }
+        
+                    if (hasKitties) {
+                        @.process.print(`\n${@.term.text("Enabled kitties(" + hasKitties + "):", ["white", "bold"])}`);
+                        @.process.print.dash();
+                        for (let key in json.kitties) {
+                            if ((key.split(".")[0] === kitty) || (key === kitty)) {
+                                @.process.print(`    ${@.term.text(key, "yellow")}: ${@.term.text(@.jsonize(json.kitties[key], 10).replace(/\n/g, "\n    "), "cyan")}`);
+                            }
+                        }
+                    } else {
+                        @.process.print(`\n${@.term.text("No kitties[", ["white", "bold"])}${@.term.text(kitty, "cyan")}${@.term.text("]", ["white", "bold"])} ${@.term.text("enabled", "red")}`);
+                    }
+        
+                    @.process.print("");
+        
+                    this.next();
+        
+                }).pipe(this);
+        
+            }).finished(function (error) {
+        
+                if (error) {
+                    @error(error);
+                    process.exit(1);
+                    return;
+                }
+        
+                process.exit(0);
+        
+            });
+        
+        };
+        
+        const executeKittyCommand = function (switches) {
+        
+            let { path, ignoredMewchanPath } = resolveMewchanPath(switches);
+        
+            return resolveMewchanJSON(switches, path).then(function (kitties, factories, json, hakoJSON, usage) {
+        
+                let kitty = undefined;
+                if (ignoredMewchanPath) {
+                    kitty = switches.commands[1];
+                } else {
+                    kitty = switches.commands[2];
+                }
+        
+                if (!kitty) {
+                    throw new Error("Missing kitty name");
+                }
+        
+                let kittyPath = @path(path, "kitties", kitty.split(".")[0]);
+        
+                @info(`Kitty[${kitty}]: Executing command [${switches.rests.join(" ")}]`);
+        
+                executeShell(switches.rests[0], switches.rests.slice(1), kittyPath, process.env).pipe(this);
+        
+            }).finished(function (error) {
+        
+                if (error) {
+                    @error(error);
+                    process.exit(1);
+                    return;
+                }
+        
+                process.exit(0);
+        
+            });
+        
+        };
+        
+        const startKittyCommand = function (switches) {
+        
+            switch (switches.commands[0]) {
+                case "init": { return initKitty(switches); };
+                case "for-each": { return forEachKitty(switches); };
+                case "list": { return listKitties(switches); };
+                case "info": { return showKittyInfo(switches); };
+                case "check": { return checkKitties(switches); };
+                case "exec":
+                case "execute": { return executeKittyCommand(switches); };
+                default: {
+                    return @.async.reject(new Error("Unknown kitty command"));
+                };
+            }
+        
+        };
+        
+        module.exports.command = startKittyCommand;
+        
+        module.exports.forEachKitty = forEachKitty
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/manager.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        @import("js.engine");
+        
+        const { constructManager } = require("../lib/manager.js");
+        
+        /**
+         * [命令] 尝试启动Hako管理工具
+         * @function <command.manager>
+         */
+        const startHakoManager = function (switches) {
+        
+            let homePath = switches.settings.homePath;
+        
+            if (!@.fs.exists.dir(homePath)) {
+                if (@.fs.exists(homePath)) {
+                    @error(`Home path is not a dir ${homePath}`);
+                }
+                @.fs.makeDirs(homePath);
+            }
+        
+            return constructManager(homePath).then(function (url, pid, manager, error) {
+        
+                if (switches.settings.starter) {
+                    if (process.send) {
+                        process.send({
+                            "pid": pid,
+                            "url": url
+                        });
+                    } else {
+                        @error(`No starter found for message back`);
+                    }
+                } else {
+                    if (process.send) {
+                        @warn("Unknown IPC channel for hako commands");
+                    }
+                }
+        
+                if (!manager) {
+                    if (error) {
+                        @info(`Manager[${pid}](No Responding) has already started: ${url}`);
+                    } else {
+                        @info(`Manager[${pid}] has already started: ${url}`);
+                    }
+                    process.exit(0);
+                }
+        
+                @celebr(`Manager[${pid}] started: ${url}`);
+        
+                const scheduleGC = function () {
+        
+                    manager.refreshHakos().finished(function (error) {
+        
+                        if (error) {
+                            @error(error);
+                        }
+        
+                        @engine.gc();
+        
+                        setTimeout(scheduleGC, 5000).unref;
+        
+                    });
+        
+                };
+        
+                scheduleGC();
+        
+                this.next();
+        
+            });
+        
+        };
+        
+        module.exports.command = startHakoManager
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/mew.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        @import("js.engine");
+        @import("mewchan.mgnt");
+        
+        const { initialKitty } = require("../lib/kitty.js");
+        
+        const { resolveMewchanJSON } = require("../lib/mewchan.js");
+        
+        const scheduleGC = function () {
+        
+            @engine.gc();
+        
+            setTimeout(scheduleGC, 60 * 1000).unref();
+        
+        };
+        
+        /**
+         * [命令] 尝试启动Mewchan
+         * @function <command.mew>
+         */
+        const startMewchan = function (switches) {
+        
+            let path = switches.commands[0];
+            if (!path) {
+                path = process.cwd();
+            }
+            path = @path(path);
+        
+            return resolveMewchanJSON(switches, path).then(function (kitties, factories, json, hakoJSON, usage) {
+        
+                let extra = @.merge.simple(hakoJSON, switches.options, {
+                    "id": (@.uuid())
+                });
+        
+                if (switches.settings.debug &&
+                    (!extra.logMewWithUsages)) {
+                    extra.logMewWithUsages = ["*"];
+                }
+        
+                let paths = [path];
+        
+                if (@.fs.exists.dir(path)) {
+                    const libPath = @path(path, "lib");
+                    if (@.fs.exists.dir(libPath)) {
+                        @.fs.listFiles(path, "lib").filter((record) => {
+                            if ((@.fs.extname(record.name) === ".chan") && (record.type === "file")) {
+                                paths.push(@path(libPath, record.name));
+                            }
+                        });
+                    }
+                }
+        
+                @mewchan.start(paths, switches.settings.presets, extra).pipe(this);
+        
+            }).then(function (mewchan) {
+        
+                let kitties = Object.keys(mewchan.kitties);
+        
+                for (let kitty in mewchan.kitties) {
+                    if (kitty.split(".")[0] === "hako") {
+                        @info("Found a self-provided hako kitty");
+                        this.next(); return;
+                    }
+                }
+        
+                scheduleGC();
+        
+                mewchan.includeKitty("hako", @path(path, "data/hako", @.uuid()), undefined, {
+                    "virtual": true
+                }).then(function (kitty) {
+        
+                    initialKitty(kitty, switches.settings);
+        
+                    this.next();
+        
+                }).resolve(mewchan).pipe(this);
+        
+            });
+        
+        };
+        
+        module.exports.command = startMewchan
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/restart.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const fs = require("fs");
+        
+        const { connectManager } = require("../lib/manager.js");
+        
+        /**
+         * [命令] 尝试在后台重新启动Hako
+         * @function <command.restart>
+         */
+        const restartHako = function (switches) {
+        
+            let homePath = switches.settings.homePath;
+        
+            if (!@.fs.exists.dir(homePath)) {
+                if (@.fs.exists(homePath)) {
+                    @error(`Home path is not a dir ${homePath}`);
+                }
+                @.fs.makeDirs(homePath);
+            }
+        
+            return @.async(function () {
+        
+                connectManager(homePath).catch(this);
+        
+            }).then(function (notFoundError, connectError, url, pid) {
+        
+                if (notFoundError) {
+                    @error(`Hako manager not started with home path: ${homePath}`);
+                    process.exit(1);
+                }
+        
+                if (connectError) {
+                    @error(`Manager[${pid}](No Responding): ${url}`);
+                    process.exit(1);
+                }
+        
+                let id = switches.commands[0];
+                if (switches.commands.length === 0) {
+                    id = {
+                        "type": "mewchan",
+                        "path": process.cwd()
+                    };
+                } else {
+                    let pathID = @path(id);
+                    if (@.fs.exists(pathID)) {
+                        id = {
+                            "type": "mewchan",
+                            "path": pathID
+                        };
+                    }
+                }
+        
+                @.net.httpClient().request(url + "/restart", {
+                    "method": "POST",
+                    "dataType": "json",
+                    "data": JSON.stringify(id),
+                    "onSuccess": (result) => {
+        
+                        if (result.error) {
+                            @error(`Failed to restart hako: ${result.error}`);
+                            process.exit(1);
+                        }
+        
+                        for (let hako of result) {
+                            @celebr(`Hako[${hako.id}] has been restarted with PID[${hako.pid}]`);
+                        }
+        
+                        process.exit(0);
+        
+                    },
+                    "onError": (error) => {
+                        @error("Failed to restart mewchan");
+                        @error(error);
+                        process.exit(1);
+                    }
+                });
+        
+            });
+        
+        };
+        
+        module.exports.command = restartHako
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/shutdown.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const { shutdownManager } = require("../lib/manager.js");
+        
+        /**
+         * [命令] 关闭Hako管理器以及下属的Hako
+         * @function <command.shutdown>
+         */
+        const shutdownHakoManager = function (switches) {
+        
+            let homePath = switches.settings.homePath;
+        
+            if (!@.fs.exists.dir(homePath)) {
+                @celebr(`No hako running with home path: ${homePath}`);
+            }
+        
+            return shutdownManager(homePath).then(function (pids) {
+        
+                if (pids.length > 0) {
+                    @celebr(`All hakos and manager have been shutdown with home path: ${homePath}`);
+                } else {
+                    @celebr(`No hako running with home path: ${homePath}`);
+                }
+        
+                process.exit(0);
+        
+            });
+        
+        };
+        
+        module.exports.command = shutdownHakoManager
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/start.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const fs = require("fs");
+        
+        const { ensureHakoDaemon } = require("../lib/daemon.js");
+        const { resolveMewchanJSON } = require("../lib/mewchan.js");
+        
+        /**
+         * [命令] 在后台开启一个Mewchan
+         * @function <command.start>
+         */
+        const startHako = function (switches) {
+        
+            let homePath = switches.settings.homePath;
+        
+            if (!@.fs.exists.dir(homePath)) {
+                if (@.fs.exists(homePath)) {
+                    @error(`Home path is not a dir ${homePath}`);
+                }
+                @.fs.makeDirs(homePath);
+            }
+        
+            let path = switches.commands[0];
+            if (!path) {
+                path = process.cwd();
+            }
+        
+            return resolveMewchanJSON(switches, path).then(function (kitties, factories, json, hakoJSON, usage) {
+        
+                ensureHakoDaemon(switches).then(function (notFoundError, connectError, url, pid) {
+        
+                    @.net.httpClient().request(url + "/start", {
+                        "method": "POST",
+                        "dataType": "json",
+                        "data": JSON.stringify({
+                            "type": "mewchan",
+                            "path": process.cwd(),
+                            "usage": usage,
+                            "restart": switches.settings.restart,
+                            "settings": {
+                                "env": Object.assign({}, process.env),
+                                "autorestart": switches.settings.autorestart,
+                                "commands": switches.commands,
+                                "options": switches.options,
+                                "settings": switches.settings
+                            }
+                        }),
+                        "onSuccess": (result) => {
+        
+                            if (result.error) {
+                                @error(`Failed to start hako: ${result.error}`);
+                                process.exit(1);
+                            }
+        
+                            @celebr(`Hako[${result.id}] has been started with PID[${result.pid}]`);
+                            process.exit(0);
+                        },
+                        "onError": (error) => {
+                            @error("Failed to start mewchan");
+                            @error(error);
+                            process.exit(1);
+                        }
+                    });
+        
+                }).pipe(this);
+        
+            });
+        
+        };
+        
+        module.exports.command = startHako
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/status.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const { connectManager } = require("../lib/manager.js");
+        
+        const leftPad = function (text, length, styles) {
+        
+            text = text + "";
+        
+            if (text.length >= length) {
+                return @.term.text(text, styles);
+            }
+        
+            while (text.length < length) {
+                text = "          " + text;
+            }
+        
+            return @.term.text(text.slice(-length), styles);
+        
+        };
+        
+        const rightPad = function (text, length, styles) {
+        
+            text = text + "";
+        
+            if (text.length >= length) {
+                return @.term.text(text, styles);
+            }
+        
+            while (text.length < length) {
+                text = text + "          ";
+            }
+        
+            return @.term.text(text.slice(0, length), styles);
+        
+        };
+        
+        /**
+         * [命令] 列表显示所有Hako
+         * @function <command.status>
+         */
+        const startHakoStatus = function (switches) {
+        
+            let homePath = switches.settings.homePath;
+        
+            if (!@.fs.exists.dir(homePath)) {
+                @error(`Home path not available: ${homePath}`);
+                process.exit(1);
+            }
+        
+            return @.async(function () {
+        
+                connectManager(homePath).catch(this);
+        
+            }).then(function (notFoundError, connectError, url, pid) {
+        
+                if (notFoundError) {
+                    @error(`Hako manager not started with home path: ${homePath}`);
+                    process.exit(1);
+                }
+        
+                if (connectError) {
+                    @error(`Manager[${pid}](No Responding): ${url}`);
+                    process.exit(1);
+                }
+        
+                @.net.httpClient().request(url + "/status", {
+                    "dataType" : "json",
+                    "onSuccess": function (result, request) {
+        
+                        if (result.error) {
+                            @error(`Failed to status hako: ${result.error}`);
+                            process.exit(1);
+                        }
+        
+                        process.stdout.write(`\nHako manager[${@.term.text(result.manager.pid, "cyan")}]: ${@.term.text(result.manager.url, "yellow")}\n\n`);
+                        if (result.hakos.length > 0) {
+                            process.stdout.write(`${leftPad("PID", 6)} ${rightPad("ID", 40)} PATH\n`);
+                            process.stdout.write("--------------------------------------------------------------------------------\n");
+                            result.hakos.forEach((hako, index) => {
+                                process.stdout.write(`${leftPad(hako.pid ? hako.pid : "?", 6, "cyan")} ${rightPad(hako.id, 40, hako.online ? "green" : "red")} ${@.term.text(hako.path, hako.autorestart ? "yellow" : "")}\n`);
+                            });
+                            process.stdout.write("\n");
+                            if (result.hakos.length > 1) {
+                                process.stdout.write(`There are ${@.term.text(result.hakos.length + "", "cyan")} managed hakos in total at ${@.format.date(new Date(), 'YYYY-M-D hh:mm:ss')}\n\n`);
+                            } else {
+                                process.stdout.write(`There is only ${@.term.text(result.hakos.length + "", "cyan")} managed hako at ${@.format.date(new Date(), 'YYYY-M-D hh:mm:ss')}\n\n`);
+                            }
+                        } else {
+                            process.stdout.write(`There is ${@.term.text("no", "cyan")} hako running at ${@.format.date(new Date(), 'YYYY-M-D hh:mm:ss')}\n\n`);
+                        }
+        
+                        process.exit(0);
+        
+                    },
+                    "onError": function (error) {
+                        @error(`Manager[${pid}] error: ${url}`);
+                        @error(error);
+                        process.exit(1);
+                    }
+                });
+        
+            });
+        
+        };
+        
+        module.exports.command = startHakoStatus
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/stop.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const fs = require("fs");
+        
+        const { connectManager } = require("../lib/manager.js");
+        
+        /**
+         * [命令] 停止一个Hako
+         * @function <command.stop>
+         */
+        const stopHako = function (switches) {
+        
+            let homePath = switches.settings.homePath;
+        
+            if (!@.fs.exists.dir(homePath)) {
+                @error(`Home path not available: ${homePath}`);
+                process.exit(1);
+            }
+        
+            return @.async(function () {
+        
+                connectManager(homePath).catch(this);
+        
+            }).then(function (notFoundError, connectError, url, pid) {
+        
+                if (notFoundError) {
+                    @error(`Hako manager not started with home path: ${homePath}`);
+                    process.exit(1);
+                }
+        
+                if (connectError) {
+                    @error(`Manager[${pid}](No Responding): ${url}`);
+                    process.exit(1);
+                }
+        
+                let id = switches.commands[0];
+                if (switches.commands.length === 0) {
+                    id = {
+                        "type": "mewchan",
+                        "path": process.cwd()
+                    };
+                } else {
+                    let pathID = @path(id);
+                    if (@.fs.exists(pathID)) {
+                        id = {
+                            "type": "mewchan",
+                            "path": pathID
+                        };
+                    }
+                }
+        
+                @.net.httpClient().request(url + "/stop", {
+                    "method": "POST",
+                    "dataType": "json",
+                    "data": JSON.stringify(id),
+                    "onSuccess": (result) => {
+        
+                        if (result.error) {
+                            @error(`Failed to stop hako: ${result.error}`);
+                            process.exit(1);
+                        }
+        
+                        for (let hako of result) {
+                            @celebr(`Hako[${hako.id}] has been stopped on PID[${hako.pid}]`);
+                        }
+        
+                        process.exit(0);
+        
+                    },
+                    "onError": (error) => {
+                        @error("Failed to stop mewchan");
+                        @error(error);
+                        process.exit(1);
+                    }
+                });
+        
+            });
+        
+        };
+        
+        module.exports.command = stopHako
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/upgrade.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const fs = require("fs");
+        
+        const alreadyUpdated = "Already up-to-date.";
+        
+        module.exports.command = function (switches) {
+            var versionJSON;
+        
+            try {
+                versionJSON = JSON.parse(fs.readFileSync(@path(__dirname, "../../dist/upgrade/version.json")).toString("utf-8"));
+            } catch (ex) {
+                versionJSON = JSON.parse(fs.readFileSync(@path(__dirname, "../../etc/upgrade/version.json")).toString("utf-8"));
+            }
+        
+            var realHakoPath = @realpath(process.argv[1]);
+        
+            return @.async(function () {
+        
+                if (@realpath(@path(__dirname,"..","..","bin","hako")) == realHakoPath){
+                    console.log(alreadyUpdated);
+                    @debug("In dev mode, no need to upgrade");
+                    process.exit(0);
+                }
+        
+                if (versionJSON.url) {
+        
+                    @.net.httpClient().request(versionJSON.url + "?" + Date.now(),{
+                        dataType  : "json",
+                        onSuccess : this.next,
+                        onError   : this.reject
+                    });
+        
+                } else {
+                    console.log(alreadyUpdated);
+                    @debug("version JSON url not found, there is no possibility to get here");
+                    process.exit(0);
+                }
+        
+            }).then(function(result){
+        
+                if (result.version == versionJSON.version){
+                    console.log(alreadyUpdated);
+                    @debug("Version same , no need to upgrade");
+        
+                } else {
+                    console.log("Upgrade hako from : " + versionJSON.version + " to " + result.version);
+                    @.fs.writeFile.sync(realHakoPath,result.code);
+                }
+        
+                process.exit(0);
+            })
+        }
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/cmd/watch.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        @import("js.engine");
+        @import("mewchan.mgnt");
+        
+        const { spawnHako, killProcess } = require("../lib/process.js");
+        
+        const loadHakoIgnores = function (path, watchDotFiles) {
+        
+            const ignores = Object.create(null);
+            if (!watchDotFiles) {
+                ignores["//.*"] = true;
+            }
+        
+            const hakoIgnore = @path(path, ".hakoignore");
+            if (@.fs.exists(hakoIgnore)) {
+                @.fs.readFile.sync(hakoIgnore).toString("utf8").split(/\r|\n|\r\n/).forEach((line) => {
+                    line = line.trim();
+                    if (line) {
+                        ignores[line] = true;
+                    }
+                });
+            }
+        
+            return Object.keys(ignores);
+        
+        };
+        
+        const loadWatchExtnames = function (extnames, noDefaultExtnames) {
+        
+            let results = Object.create(null);
+            if (!noDefaultExtnames) {
+                results[".js"] = true;
+                results[".json"] = true;
+            }
+        
+            if (extnames) {
+                for (let extname of extnames) {
+                    if (extname[0] !== ".") {
+                        extname = "." + extname;
+                    }
+                    results[extname] = true;
+                }
+            }
+        
+            return results;
+        
+        };
+        
+        /**
+         * [命令] 尝试启动Mewchan，并监视文件目录变化自动重启
+         * @function <command.watch>
+         */
+        const watchMewchan = function (switches) {
+        
+            let path = switches.commands[0];
+            if (!path) {
+                path = process.cwd();
+            }
+            path = @path(path);
+        
+            let lastTime = 0;
+            let restarting = undefined;
+        
+            let ignores = loadHakoIgnores(path, switches.settings.watchDotFiles);
+            let extnames = loadWatchExtnames(switches.settings.watchExtnames,
+                                             switches.settings.noWatchJSExtnames);
+        
+            let spawned = undefined;
+        
+            const restartMewchan = function (wait) {
+        
+                if (!isFinite(wait)) {
+                    wait = 500;
+                }
+        
+                lastTime = Date.now();
+        
+                if (restarting) {
+                    return restarting;
+                }
+        
+                restarting = @.async(function () {
+        
+                    @.delay(wait, () => {
+        
+                        let time = lastTime;
+        
+                        @.async(function () {
+        
+                            if (spawned) {
+                                @info("Killing previous mewchan");
+                                spawned.removeAllListeners("exit");
+                                killProcess(spawned.pid, spawned).pipe(this);
+                            } else {
+                                this.next();
+                            }
+        
+                        }).then(function () {
+        
+                            @info("Starting mewchan");
+        
+                            spawned = undefined;
+        
+                            spawnHako(["mew"].concat(switches.commands),
+                                      switches.options,
+                                      switches.settings).then(function (summary) {
+        
+                                spawned = summary.process;
+        
+                                spawned.on("exit", function (code) {
+                                    @error(`Unexpected exit of mewchan: ${code}`);
+                                    restartMewchan();
+                                });
+        
+                                this.next();
+        
+                            }).pipe(this);
+        
+                        }).finished((error, summary) => {
+        
+                            if (error) {
+                                @error(error);
+                            }
+        
+                            restarting = undefined;
+        
+                            if (lastTime !== time) {
+                                restartMewchan().pipe(this);
+                            } else {
+                                this.next();
+                            }
+        
+                        });
+        
+                    });
+                });
+        
+                return restarting;
+        
+            };
+        
+            @.fs.watchFile(path, ignores, (action, type, file) => {
+        
+                if ((type === "dir") || extnames[@.fs.extname(file)]) {
+        
+                    if (action !== "found") {
+                        if (type === "file") {
+                            @debug(`File ${action}: ${file}`);
+                        } else if (type === "dir") {
+                            @debug(`Dir ${action}: ${file}`);
+                        }
+                    }
+        
+                    restartMewchan(100);
+                }
+        
+            });
+        
+            return restartMewchan(0);
+        
+        };
+        
+        module.exports.command = watchMewchan
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/lib/daemon.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const fs = require("fs");
+        
+        const { connectManager } = require("../lib/manager.js");
+        
+        const { spawnHako } = require("../lib/process.js");
+        
+        const ensureHakoDaemon = function (switches) {
+        
+            let homePath = switches.settings.homePath;
+        
+            if (!@.fs.exists.dir(homePath)) {
+                if (@.fs.exists(homePath)) {
+                    @error(`Home path is not a dir ${homePath}`);
+                }
+                @.fs.makeDirs(homePath);
+            }
+        
+            return @.async(function () {
+        
+                connectManager(homePath).catch(this);
+        
+            }).then(function (notFoundError, connectError, url, pid) {
+        
+                if (!notFoundError) {
+                    this.next(notFoundError, connectError, url, pid);
+                    return;
+                }
+        
+                @info(`Starting hako manager`);
+        
+                const dir = @path(homePath, "log/manager");
+        
+                @.fs.makeDirs(dir);
+        
+                const log = @path(dir, @.format.date(new Date(), "YYYY-MM-DD") + ".log");
+        
+                const fds = {
+                    "stdout": fs.openSync(log, "a"),
+                    "stderr": fs.openSync(log, "a"),
+                };
+        
+                spawnHako(["manager"], {}, {
+                    "homePath": switches.settings.homePath,
+                    "starter": process.pid,
+                    "debug": switches.settings.debug
+                }, fds).then(function (info) {
+        
+                    try {
+                        fs.closeSync(fds.stdout);
+                    } catch (error) {
+                        // Do nothing
+                    }
+        
+                    try {
+                        fs.closeSync(fds.stderr);
+                    } catch (error) {
+                        // Do nothing
+                    }
+        
+                    let callbacked = false;
+        
+                    info.process.on("exit", (code) => {
+                        let message = `Manager[${info.process.pid}] died with exit code: ${code}`;
+                        if (callbacked) {
+                            @error(message); return;
+                        }
+                        callbacked = true;
+                        this.reject(new Error(message));
+                    });
+        
+                    info.process.on("message", (payload) => {
+        
+                        // TODO: check bugs on IPC channel disconnected?
+                        info.process.disconnect();
+        
+                        var client = new @.net.httpClient();
+        
+                        client.request(payload.url + "/ping", {
+                            "onSuccess": () => {
+                                if (!callbacked) {
+                                    callbacked = true;
+                                    this.next(notFoundError, undefined, payload.url, payload.pid);
+                                }
+                            },
+                            "onError": (error) => {
+                                if (!callbacked) {
+                                    callbacked = true;
+                                    this.next(notFoundError, error, payload.url, payload.pid);
+                                }
+                            }
+                        });
+        
+                    });
+        
+                }).pipe(this);
+        
+            });
+        
+        };
+        
+        module.exports.ensureHakoDaemon = ensureHakoDaemon
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/lib/hako.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const fs = require("fs");
+        
+        const { killProcess, spawnHako, spawnProcess } = require("./process.js");
+        
+        const hakoHandlers = Object.create(null);
+        
+        /**
+         * [内部:Hako] Hako具体任务描述
+         */
+        const Hako = function Hako(manager, type, path, usage, settings) {
+        
+            this.manager = manager;
+        
+            this.id = Hako.getHakoID(type, path, usage);
+        
+            this.type = type;
+            this.path = path;
+            if (usage) {
+                this.usage = usage;
+            }
+        
+            this.settings = settings;
+        
+        };
+        
+        /**
+         * [内部:Hako] 是否脱离了Manager子进程管理
+         */
+        Hako.prototype.detached = false;
+        
+        /**
+         * [内部:Hako] 最后一次状态更新时间
+         */
+        Hako.prototype.lastUpdate = 0;
+        
+        /**
+         * [内部:Hako] 日志文件FD
+         */
+        Object.defineProperty(Hako.prototype, "fds", {
+            "get": function () {
+        
+                let dir = @path(this.manager.homePath, "log", this.id);
+                var file = @path(dir, @.format.date(new Date(), "YYYY-MM-DD") + ".log");
+        
+                if (this.latestFDs && (this.latestFDs.file === file)) {
+                    return this.latestFDs;
+                }
+        
+                @.fs.makeDir(dir);
+        
+                if (this.latestFDs) {
+                    if (this.latestFDs.stdout) {
+                        fs.closeSync(this.latestFDs.stdout);
+                        delete this.latestFDs.stdout;
+                    }
+                    if (this.latestFDs.stderr) {
+                        fs.closeSync(this.latestFDs.stderr);
+                        delete this.latestFDs.stderr;
+                    }
+                }
+        
+                this.latestFDs = {
+                    "file": file,
+                    "stdout": fs.openSync(file, "a"),
+                    "stderr": fs.openSync(file, "a")
+                };
+        
+                return this.latestFDs;
+        
+            }
+        });
+        
+        /**
+         * [内部:Hako] 是否在线
+         */
+        Object.defineProperty(Hako.prototype, "online", {
+            "get": function () {
+                return this.latestOnline ? true : false;
+            },
+            "set": function (value) {
+                this.latestOnline = value ? true : false;
+                this.lastUpdate = Date.now();
+            }
+        });
+        
+        /**
+         * [内部:Hako] 发送Hako事件广播
+         * @call {(name) -> Async}
+         */
+        Hako.prototype.broadcast = function (name) {
+        
+            return @.async.resolve();
+        
+        };
+        
+        /**
+         * [内部:Hako] 停止Hako
+         * @call {() -> Async}
+         */
+        Hako.prototype.stop = function () {
+        
+            var hako = this;
+        
+            return @.lock(this, function () {
+        
+                if ((!hako.pid) || ((!hako.process) && (!hako.detached))) {
+                    return;
+                }
+        
+                const pid = @path(hako.manager.homePath, "pids", hako.pid + "");
+        
+                return @.async(function () {
+        
+                    hako.broadcast("beforeStopHako").catch(this);
+        
+                }).then(function () {
+        
+                    @info(`Stopping hako[${hako.id}]`);
+        
+                    killProcess(hako.pid, hako.process).pipe(this);
+        
+                }).then(function () {
+        
+                    @.fs.deleteFile(pid).catch(this);
+        
+                }).then(function (error) {
+        
+                    if (error) {
+                        @error(`Failed to delete PID file ${pid}`);
+                        @error(error);
+                    }
+        
+                    @debug(`Hako [${hako.id}] is stopped`);
+        
+                    delete hako.process;
+                    delete hako.pid;
+        
+                    hako.detached = false;
+                    hako.online = false;
+                    hako.lastUpdate = Date.now();
+        
+                    this.next();
+        
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Hako] 开始Hako
+         * @call {() -> Async}
+         */
+        Hako.prototype.start = function () {
+        
+            const hako = this;
+        
+            return @.lock(this, function () {
+        
+                if (hako.online) {
+                    return @.async.resolve();
+                }
+        
+                return @.async(function () {
+        
+                    @info(`Starting hako[${hako.id}]`);
+        
+                    hako.broadcast("beforeStartHako", 3).catch(this);
+        
+                }).then(function () {
+        
+                    if (!hakoHandlers[hako.type]) {
+                        throw new Error(`Invalid hako type ${hako.type}`);
+                    }
+        
+                    hakoHandlers[hako.type](hako).pipe(this);
+        
+                }).then(function (info) {
+        
+                    hako.pid = info.process.pid;
+                    hako.process = info.process;
+        
+                    hako.info = {
+                        "id": hako.id,
+                        "type": hako.type,
+                        "path": hako.path,
+                        "usage": hako.usage,
+                        "settings": (@.merge(hako.settings)),
+                        "pid": info.process.pid,
+                        "command": info.command,
+                    };
+        
+                    hako.online = true;
+        
+                    @info(`Hako[${hako.id}] is online[${hako.pid}]`);
+        
+                    const pid = @path(hako.manager.homePath, "pids", hako.pid + "");
+        
+                    hako.process.on("exit", function (code) {
+        
+                        @info(`Hako[${hako.id}] is offline[${hako.pid}]`);
+        
+                        hako.online = false;
+        
+                        @.fs.deleteFile(pid).rejected(function (error) {
+                            @error("Failed to delete pid file");
+                            @error(error);
+                        });
+        
+                        delete hako.process;
+        
+                        hako.broadcast("afterKillHako").finished(function () {
+        
+                            if (!hako.settings.autorestart) {
+                                @debug(`Hako[${hako.id}] will be released in 60 seconds`);
+                                return;
+                            }
+        
+                            @debug(`Hako[${hako.id}] will be restart in 3 seconds`);
+        
+                            @.delay(3000, function () {
+                                hako.start().rejected(function (error) {
+                                    @error(error);
+                                });
+                            });
+        
+                        });
+        
+                    });
+        
+                    hako.process.disconnect();
+                    hako.process.unref();
+        
+                    @.fs.writeFile(pid, JSON.stringify(hako.info, null, 4)).pipe(this);
+        
+                }).then(function () {
+        
+                    hako.broadcast("afterStartHako").finished(this.next);
+        
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Hako] 创建并开始一个Hako
+         * @call {(manager, type, path, usage, settings) -> Hako}
+         * @param <manager> {HakoManager}
+         * @param <type> {String} Hako类型
+         * @param <path> {String} Hako的工作目录
+         * @param <usage> {String} [可空] Hako的用途
+         * @param <settings> {Object} Hako的具体配置
+         */
+        Hako.start = function (manager, type, path, usage, settings) {
+        
+            const hako = new Hako(manager, type, path, usage, settings);
+        
+            let ready = hako.start();
+        
+            hako.ready = function () {
+                return ready.async();
+            };
+        
+            return hako;
+        
+        };
+        
+        /**
+         * [内部:Hako] 重新绑定Hako到Manager
+         * @call {(manager, info) -> Hako}
+         */
+        Hako.attach = function (manager, info) {
+        
+            const hako = new Hako(manager, info.type, info.path, info.usage, info.settings);
+        
+            hako.pid = info.pid;
+            hako.online = true;
+            hako.detached = true;
+        
+            hako.info = {
+                "id": hako.id,
+                "type": hako.type,
+                "path": hako.path,
+                "usage": hako.usage,
+                "settings": (@.merge(hako.settings)),
+                "pid": info.pid,
+                "command": info.command
+            };
+        
+            let ready = @.async.resolve();
+            hako.ready = function () {
+                return ready.async();
+            };
+        
+            return hako;
+        
+        };
+        
+        /**
+         * [内部:Hako]获得Hako唯一ID
+         * @call {(type, path, usage) -> String}
+         */
+        Hako.getHakoID = function (type, path, usage) {
+        
+            let id = type + "-" + @.fs.basename(path) + "-" + @.hash.md5(path).slice(-8);
+            if (usage) {
+                id += "-" + usage;
+            }
+        
+            return id;
+        
+        };
+        
+        /**
+         * [内部:Handler] Mewchan的启动方式
+         * @function <handler.mewchan>
+         */
+        hakoHandlers["mewchan"] = function (hako) {
+        
+            const dir = @path(hako.manager.homePath, "log", hako.id);
+        
+            @.fs.makeDirs(dir);
+        
+            const log = @path(dir, @.format.date(new Date(), "YYYY-MM-DD") + ".log");
+        
+            const fds = {
+                "stdout": fs.openSync(log, "a"),
+                "stderr": fs.openSync(log, "a"),
+            };
+        
+            let commands = ["mew"].concat(hako.settings.commands);
+            let options = hako.settings.options;
+            let settings = hako.settings.settings;
+        
+            return spawnHako(commands, options, settings, fds, hako.path, hako.settings.env).then(function (summary) {
+        
+                try {
+                    fs.closeSync(fds.stdout);
+                } catch (error) {
+                    // Do nothing
+                }
+        
+                try {
+                    fs.closeSync(fds.stderr);
+                } catch (error) {
+                    // Do nothing
+                }
+        
+                this.next(summary);
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Handler] Shell的启动方式
+         * @function <handler.execute>
+         */
+        hakoHandlers["execute"] = function (hako) {
+        
+            const dir = @path(hako.manager.homePath, "log", hako.id);
+        
+            @.fs.makeDirs(dir);
+        
+            const log = @path(dir, @.format.date(new Date(), "YYYY-MM-DD") + ".log");
+        
+            const fds = {
+                "stdout": fs.openSync(log, "a"),
+                "stderr": fs.openSync(log, "a"),
+            };
+        
+            let commands = hako.settings.execution;
+        
+            return spawnProcess(commands[0], commands.slice(1), hako.path, hako.settings.env, fds).then(function (summary) {
+        
+                try {
+                    fs.closeSync(fds.stdout);
+                } catch (error) {
+                    // Do nothing
+                }
+        
+                try {
+                    fs.closeSync(fds.stderr);
+                } catch (error) {
+                    // Do nothing
+                }
+        
+                this.next(summary);
+        
+            });
+        
+        };
+        
+        module.exports.Hako = Hako
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/lib/kitty.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const { connectManager } = require("./manager.js");
+        
+        /**
+         * [内部:Mewchan]打印尚未结束且超时的Async列表
+         */
+        const printUnfinisheds = function () {
+        
+            let unfinisheds = @.async.unfinisheds(10000);
+        
+            if (unfinisheds.length > 0) {
+                let codes = [ `There are ${unfinisheds.length} unfinished async(s):` ];
+                let frames = Object.create(null);
+                unfinisheds.forEach((async) => {
+                    let frame = async.frame;
+                    let key = `${frame.source}:${frame.line}:${frame.column}`;
+                    if (!frames[key]) {
+                        frames[key] = 1;
+                    } else {
+                        ++frames[key];
+                    }
+                });
+                Object.keys(frames).sort((a, b) => frames[a] - frames[b]).reverse().forEach((frame) => {
+                    codes.push("[" + ("      " + frames[frame]).slice(-5) + "]: " + frame);
+                });
+                @warn(codes.join("\n    "));
+            }
+        
+        };
+        
+        /**
+         * [内部:Mewchan] 初始化hako kitty
+         */
+        const initialKitty = function (kitty, settings) {
+        
+            if (@.process.debugging) {
+                @.schedule(10 * 1000, function () {
+                    printUnfinisheds();
+                });
+            }
+        
+            /**
+             * [Mew:hako] 获得自身Hako的设置
+             * @function <hako.settings>
+             * @call {() -> Async<settings>}
+             */
+            kitty.heardWithRPC("*", "hako.settings").then(function (content, mew) {
+        
+                return @.async.resolve(settings);
+        
+            });
+        
+            /**
+             * [Mew:hako] 获得Hako服务器的运行状态
+             * @function <hako.status>
+             * @call {() -> Async<{manager, hakos}>}
+             * @result <manager> {{pid, uptime, url}}
+             * @result <hakos> {[{online, pid, type, id, autorestart, path}]}
+             *     @param <online> {Boolean} Hako是否在线
+             *     @param <pid> {Number} Hako的进程ID
+             *     @param <type> {String} Hako的类型
+             *     @param <id> {String} Hako的全局ID
+             *     @param <autorestart> {Boolean} Hako是否在异常终止后自动重启
+             *     @param <path> {String} Hako的工作目录
+             */
+            kitty.heardWithRPC("*", "hako.status").then(function (content, mew) {
+        
+                if (!settings.managerKitty) {
+                    return @.async.reject(new Error("Permission denied"));
+                }
+        
+                return @.async(function () {
+        
+                    connectManager(settings.homePath).pipe(this);
+        
+                }).then(function (connectError, url, pid) {
+        
+                    if (connectError) {
+                        throw new Error(`Manager[${pid}](No Responding): ${url}`);
+                    }
+        
+                    @.net.httpClient().request(url + "/status", {
+                        "dataType": "json",
+                        "onSuccess": (result, request) => {
+                            if (result.error) {
+                                this.reject(new Error(`Failed to status hako: ${result.error}`));
+                                return;
+                            }
+                            this.next(result);
+                        },
+                        "onError": (error) => {
+                            this.reject(`Manager[${pid}] error: ${url}`);
+                        }
+                    });
+        
+                });
+        
+            });
+        
+            /**
+             * [Mew:hako] 用Hako启动一个进程
+             * @function <hako.execute>
+             * @call {({path, usage, restart, settings}) -> Async<{id, pid}>}
+             * @param <path> {String} Hako的工作目录
+             * @param <usage> {String} [可选][可空]Hako的用途
+             * @param <restart> {Boolean} [默认:false]当Hako已存在时，是否强制重启Hako
+             * @param <settings> {{autrestart, commands, options, settings}} Hako的设置参数
+             *     @param <autorestart> {Boolean} [可选][默认:false]当Hako异常终止时，是否重启
+             *     @param <execution> {Object} 启动进程的参数
+             * @result <pid> {Number} Hako的进程ID
+             * @result <id> {String} Hako的全局ID
+             */
+            kitty.heardWithRPC("*", "hako.execute").then(function (content, mew) {
+                if (!settings.managerKitty) {
+                    return @.async.reject(new Error("Permission denied"));
+                }
+        
+                return @.async(function () {
+        
+                    connectManager(settings.homePath).pipe(this);
+        
+                }).then(function (connectError, url, pid) {
+        
+                    if (connectError) {
+                        throw new Error(`Manager[${pid}](No Responding): ${url}`);
+                    }
+        
+                    @.net.httpClient().request(url + "/start", {
+                        "method": "POST",
+                        "dataType": "json",
+                        "data": JSON.stringify({
+                            "type": "execute",
+                            "path": content.path,
+                            "usage": content.usage,
+                            "restart": content.restart,
+                            "settings": content.settings
+                        }),
+                        "onSuccess": (result, request) => {
+                            if (result.error) {
+                                this.reject(new Error(`Failed to start hako: ${result.error}`));
+                                return;
+                            }
+                            this.next(result);
+                        },
+                        "onError": (error) => {
+                            this.reject(`Manager[${pid}] error: ${url}`);
+                        }
+                    });
+        
+                });
+            });
+        
+            /**
+             * [Mew:hako] 开始一个新Mewchan Hako
+             * @function <hako.start>
+             * @call {({path, usage, restart, settings}) -> Async<{id, pid}>}
+             * @param <path> {String} Hako的工作目录
+             * @param <usage> {String} [可选][可空]Hako的用途
+             * @param <restart> {Boolean} [默认:false]当Hako已存在时，是否强制重启Hako
+             * @param <settings> {{autrestart, commands, options, settings}} Hako的设置参数
+             *     @param <autorestart> {Boolean} [可选][默认:false]当Hako异常终止时，是否重启
+             *     @param <commands> {[String]} Mewchan启动时的命令
+             *     @param <options> {Object} Mewchan启动时的命令行参数, 以`-`开头
+             *     @param <settings> {Object} Hako启动时的命令行参数, 以`--`开头
+             * @result <pid> {Number} Hako的进程ID
+             * @result <id> {String} Hako的全局ID
+             */
+            kitty.heardWithRPC("*", "hako.start").then(function (content, mew) {
+        
+                if (!settings.managerKitty) {
+                    return @.async.reject(new Error("Permission denied"));
+                }
+        
+                return @.async(function () {
+        
+                    connectManager(settings.homePath).pipe(this);
+        
+                }).then(function (connectError, url, pid) {
+        
+                    if (connectError) {
+                        throw new Error(`Manager[${pid}](No Responding): ${url}`);
+                    }
+        
+                    @.net.httpClient().request(url + "/start", {
+                        "method": "POST",
+                        "dataType": "json",
+                        "data": JSON.stringify({
+                            "type": "mewchan",
+                            "path": content.path,
+                            "usage": content.usage,
+                            "restart": content.restart,
+                            "settings": content.settings
+                        }),
+                        "onSuccess": (result, request) => {
+                            if (result.error) {
+                                this.reject(new Error(`Failed to start hako: ${result.error}`));
+                                return;
+                            }
+                            this.next(result);
+                        },
+                        "onError": (error) => {
+                            this.reject(`Manager[${pid}] error: ${url}`);
+                        }
+                    });
+        
+                });
+        
+            });
+        
+            /**
+             * [Mew:hako] 开始一个新Mewchan Hako
+             * @function <hako.stop>
+             * @call {(id) -> Async<{id, pid}>}
+             * @param <id> {String} Hako的检索条件
+             * @result <pid> {Number} Hako的进程ID
+             * @result <id> {String} Hako的全局ID
+             */
+            kitty.heardWithRPC("*", "hako.stop").then(function (content, mew) {
+        
+                if (!settings.managerKitty) {
+                    return @.async.reject(new Error("Permission denied"));
+                }
+        
+                return @.async(function () {
+        
+                    connectManager(settings.homePath).pipe(this);
+        
+                }).then(function (connectError, url, pid) {
+        
+                    if (connectError) {
+                        throw new Error(`Manager[${pid}](No Responding): ${url}`);
+                    }
+        
+                    @.net.httpClient().request(url + "/stop", {
+                        "dataType": "json",
+                        "data": JSON.stringify(content),
+                        "onSuccess": (result, request) => {
+                            if (result.error) {
+                                this.reject(new Error(`Failed to stop hako: ${result.error}`));
+                                return;
+                            }
+                            this.next(result);
+                        },
+                        "onError": (error) => {
+                            this.reject(`Manager[${pid}] error: ${url}`);
+                        }
+                    });
+        
+                });
+        
+            });
+        
+            kitty.emitMew("hako.ready", {});
+        
+        };
+        
+        module.exports.initialKitty = initialKitty
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/lib/manager.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const http = require("http");
+        const url = require("url");
+        
+        const { snapshotProcessList, getProcessInfo, killProcess } = require("./process.js");
+        
+        const { Hako } = require("./hako.js");
+        
+        const serverCommandHandlers = Object.create(null);
+        
+        const hakoManagers = Object.create(null);
+        
+        /**
+         * [内部:Manager] 加载hakorc文件
+         * @call {(homePath) -> { id, manager }}
+         * @result <manager> {{time, command, url, pid}}
+         */
+        const loadHakoRC = function (homePath) {
+        
+            let rcPath = @path(homePath, "hakorc");
+        
+            let rc = undefined;
+            if (@.fs.exists.file(rcPath)) {
+                try {
+                    rc = JSON.parse(@.fs.readFile.sync(rcPath).toString("utf8"));
+                } catch (error) {
+                    @error("Failed to load hakorc");
+                    @error(error);
+                }
+            }
+        
+            if ((!rc) || (!rc.id)) {
+                rc = { "id": (@.uuid()) };
+                @.fs.writeFile.sync(rcPath, JSON.stringify(rc));
+            }
+        
+            return rc;
+        
+        };
+        
+        /**
+         * [内部:Manager] 尝试获得Manager链接方式
+         * @result {Async<pingError, url, pid>}
+         */
+        const directConnectManager = function (homePath) {
+        
+            let rc = undefined;
+        
+            return @.async(function () {
+        
+                if (!@.fs.exists.dir(homePath)) {
+                    throw new Error(`No manager found at ${homePath}`);
+                }
+        
+                rc = loadHakoRC(homePath);
+        
+                if ((!rc.manager) || (!rc.manager.pid)) {
+                    throw new Error(`No manager found at ${homePath}`);
+                }
+        
+                getProcessInfo(rc.manager.pid).pipe(this);
+        
+            }).then(function (info) {
+        
+                if (info.command !== rc.manager.command) {
+                    throw new Error(`No manager found at ${homePath}`);
+                }
+        
+                let client = @.net.httpClient();
+        
+                client.request(rc.manager.url + "/ping", {
+                    "method": "GET",
+                    "onSuccess": () => {
+                        this.next(null, rc.manager.url, rc.manager.pid);
+                    },
+                    "onError": (error) => {
+                        this.next(error, rc.manager.url, rc.manager.pid);
+                    }
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Manager] 创建Server
+         * @result {Async<server, port, url>}
+         */
+        const createServer = function (manager) {
+        
+            return @.async(function () {
+        
+                @.net.availablePort({
+                    "port": 30011 + (@.hash(manager.homePath) % 17761),
+                    "getNextPort": function (port) {
+                        return 30011 + (port + 55281) % 17761;
+                    }
+                }, this.test);
+        
+            }).then(function (port) {
+        
+                var server = http.createServer(function (request, response) {
+        
+                    var command = request.url;
+                    if (command[0] === "/") {
+                        command = command.toLowerCase().substr(1);
+                    } else {
+                        command = command.split("://").slice(1).join("://").split("/").slice(1).join("/");
+                    }
+        
+                    let query = command.split("?").slice(1).join("?");
+                    command = command.split("?")[0];
+        
+                    @debug(`Received server command[${command}]`);
+        
+                    const handler = serverCommandHandlers[command];
+                    if (!handler) {
+                        response.writeHead(404);
+                        response.end((error) => {});
+                        return;
+                    }
+        
+                    @.async(function () {
+        
+                        @.async.ensure(handler(request, response, manager)).catch(this);
+        
+                    }).then(function (error, result) {
+        
+                        if (error) {
+                            @error(error);
+                        }
+        
+                        if (error) {
+                            response.end(JSON.stringify({
+                                "error": error.message
+                            }), (error) => {});
+                        } else {
+                            response.end(JSON.stringify({}), (error) => {});
+                        }
+        
+                        this.next()
+        
+                    });
+        
+                });
+        
+                server.listen(port, "localhost", (error) => {
+        
+                    if (error) {
+                        this.reject(error); return;
+                    }
+        
+                    this.next(server, port, `http://localhost:${port}`);
+        
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Manager] 尝试创建Manager，如果已经存在则直接返回连接方式
+         * @result {Async<url, pid, newManager, pingError>}
+         */
+        const constructManager = function (homePath) {
+        
+            homePath = @path(homePath);
+        
+            if (!@.fs.exists.dir(homePath)) {
+                try {
+                    @.fs.makeDirs(homePath);
+                } catch (error) {
+                    return @.async.reject(error);
+                }
+            }
+        
+            return @.lock(@path(homePath, "lock"), function () {
+        
+                return @.async(function () {
+        
+                    directConnectManager(homePath).catch(this);
+        
+                }).then(function (notFoundError, connectError, url, pid) {
+        
+                    if (!notFoundError) {
+                        this.next(url, pid); return;
+                    }
+        
+                    if (!hakoManagers[homePath]) {
+                        hakoManagers[homePath] = new HakoManager(homePath);
+                    }
+        
+                    hakoManagers[homePath].ready().then(function () {
+        
+                        let manager = hakoManagers[homePath];
+        
+                        this.next(manager.url, process.pid, manager, connectError);
+        
+                    }).pipe(this);
+        
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Manager] 尝试连接Manager，该方法内置了manager全局锁
+         * @result {Async<pingError, url, pid>}
+         */
+        const connectManager = function (homePath) {
+        
+            if (!@.fs.exists.dir(homePath)) {
+                return @.async.reject(new Error(`No manager found at ${homePath}`));
+            }
+        
+            return @.lock(@path(homePath, "lock"), function () {
+        
+                return directConnectManager(homePath);
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Manager] 关闭Manager
+         * @result {Async}
+         */
+        const shutdownManager = function (homePath) {
+        
+            // TODO: make the shutdown more elegant
+        
+            const runnings = [];
+        
+            let snapshots = undefined;
+        
+            const rc = loadHakoRC(homePath);
+        
+            return @.async(function () {
+        
+                @info("Scanning manager and hakos");
+        
+                snapshotProcessList().then(function (result) {
+                    snapshots = result;
+                    this.next();
+                }).pipe(this);
+        
+            }).then(function () {
+        
+                if (rc.manager && rc.manager.pid && snapshots[rc.manager.pid] &&
+                    (rc.manager.command === snapshots[rc.manager.pid].command)) {
+                    runnings.push(rc.manager);
+                }
+        
+                const pids = @path(homePath, "pids");
+        
+                if (!@.fs.exists.dir(pids)) {
+                    this.next(); return;
+                }
+        
+                @.async.all(@.fs.listFiles(pids), function (record) {
+        
+                    if (record.type !== "file") {
+                        this.next(); return;
+                    }
+        
+                    var pid = @path(pids, record.name);
+        
+                    let json = undefined;
+                    try {
+                        json = JSON.parse(@.fs.readFile.sync(pid).toString("utf8"));
+                    } catch (error) {
+                        @error(`Failed to load pid file ${pid}`);
+                        @error(error);
+                    }
+        
+                    const deletePID = function () {
+                        try {
+                            @.fs.deleteFile.sync(pid);
+                        } catch (error) {
+                            @error(`Failed to delete pid file ${pid}`);
+                            @error(error);
+                        };
+                    };
+        
+                    if (!json) {
+                        deletePID(); this.next(); return;
+                    }
+        
+                    if (!json.id) {
+                        @error(`Invalid hako PID file ${pid}`);
+                        deletePID(); this.next(); return;
+                    }
+        
+                    if (!snapshots[json.pid]) {
+                        if (!json.settings.autorestart) {
+                            deletePID();
+                        }
+                        this.next(); return;
+                    }
+        
+                    if (snapshots[json.pid].command !== json.command) {
+                        if (!json.settings.autorestart) {
+                            deletePID();
+                        }
+                        this.next(); return;
+                    }
+        
+                    runnings.push(json);
+        
+                    this.next();
+        
+                }).pipe(this);
+        
+            }).all(runnings, -1, function (info) {
+        
+                killProcess(info.pid).catch(this);
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Manager] Hako管理器
+         * @call {(homePath) -> HakoManager}
+         */
+        const HakoManager = function HakoManager(homePath) {
+        
+            const manager = this;
+        
+            this.startTime = Date.now();
+        
+            this.homePath = homePath;
+        
+            this.hakos = Object.create(null);
+        
+            let command = undefined;
+        
+            const ready = @.async(function () {
+        
+                getProcessInfo(process.pid).then(function (info) {
+        
+                    command = info.command;
+        
+                    this.next();
+        
+                }).pipe(this);
+        
+            }).then(function () {
+        
+                const rc = loadHakoRC(homePath);
+        
+                const pids = @path(homePath, "pids");
+                if (!@.fs.exists.dir(pids)) {
+                    @.fs.deleteFile.sync(pids);
+                    @.fs.makeDirs(pids);
+                }
+        
+                const attaches = [];
+                const starts = [];
+        
+                let snapshots = undefined;
+        
+                @.async(function () {
+        
+                    snapshotProcessList().then(function (result) {
+                        snapshots = result;
+                        this.next();
+                    }).pipe(this);
+        
+                }).all(@.fs.listFiles(pids), function (record) {
+        
+                    if (record.type !== "file") {
+                        this.next(); return;
+                    }
+        
+                    var pid = @path(pids, record.name);
+        
+                    let json = undefined;
+                    try {
+                        json = JSON.parse(@.fs.readFile.sync(pid).toString("utf8"));
+                    } catch (error) {
+                        @error(`Failed to load pid file ${pid}`);
+                        @error(error);
+                    }
+        
+                    const deletePID = function () {
+                        try {
+                            @.fs.deleteFile.sync(pid);
+                        } catch (error) {
+                            @error(`Failed to delete pid file ${pid}`);
+                            @error(error);
+                        };
+                    };
+        
+                    if (!json) {
+                        deletePID(); this.next(); return;
+                    }
+        
+                    if (!json.id) {
+                        @error(`Invalid hako PID file ${pid}`);
+                        deletePID(); this.next(); return;
+                    }
+        
+                    if (!snapshots[json.pid]) {
+                        if (json.settings.autorestart) {
+                            starts.push(json);
+                        }
+                        deletePID(); this.next(); return;
+                    }
+        
+                    if (snapshots[json.pid].command !== json.command) {
+                        if (json.settings.autorestart) {
+                            starts.push(json);
+                        }
+                        deletePID(); this.next(); return;
+                    }
+        
+                    attaches.push(json);
+                    this.next(); return;
+        
+                }).all(attaches, function (info) {
+        
+                    if (manager.hakos[info.id]) {
+                        this.next(); return;
+                    }
+        
+                    @debug(`Attaching online[${info.pid}] hako[${info.id}]: ${info.command}`);
+        
+                    manager.hakos[info.id] = Hako.attach(manager, info);
+        
+                    manager.hakos[info.id].ready().pipe(this);
+        
+                }).all(starts, function (info) {
+        
+                    if (manager.hakos[info.id]) {
+                        this.next(); return;
+                    }
+        
+                    @debug(`Starting offline hako[${info.id}]: ${info.command}`);
+        
+                    manager.hakos[info.id] = Hako.start(manager, info.type, info.path, info.usage, info.settings);
+        
+                    manager.hakos[info.id].ready().pipe(this);
+        
+                }).then(function () {
+        
+                    createServer(manager).then(function (server, port, url) {
+        
+                        manager.server = server;
+                        manager.port = port;
+                        manager.url = url;
+        
+                        this.next();
+        
+                    }).pipe(this);
+        
+                }).then(function () {
+        
+                    rc.manager = {
+                        "time": Date.now(),
+                        "command": command,
+                        "url": manager.url,
+                        "pid": process.pid
+                    };
+        
+                    let rcPath = @path(homePath, "hakorc");
+        
+                    @.fs.writeFile(rcPath, JSON.stringify(rc, null, 4)).pipe(this);
+        
+                }).pipe(this);
+        
+            });
+        
+            this.ready = function () {
+                return ready.async();
+            };
+        
+        };
+        
+        /**
+         * [内部:Manager] 列表所有的Hako
+         * @call {() -> Async<[hako ...]>}
+         * @result <hako> {{online, pid, type, id, autorestart, path}}
+         *     @param <online> {Boolean} Hako是否在线
+         *     @param <pid> {Number} Hako的进程ID
+         *     @param <type> {String} Hako的类型
+         *     @param <id> {String} Hako的全局ID
+         *     @param <autorestart> {Boolean} Hako是否在异常终止后自动重启
+         *     @param <path> {String} Hako的工作目录
+         */
+        HakoManager.prototype.listHakos = function () {
+        
+            const manager = this;
+        
+            return this.ready().then(function () {
+        
+                const hakos = [];
+        
+                for (let id in manager.hakos) {
+                    let hako = manager.hakos[id];
+                    hakos.push({
+                        "online": hako.online,
+                        "pid": hako.pid,
+                        "type": hako.type,
+                        "autorestart": hako.settings.autorestart,
+                        "id": hako.id,
+                        "path": hako.path
+                    });
+                }
+        
+                this.next(hakos);
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Manager] 开始一个Hako任务
+         * @call {(type, path, usage, settings, restart) -> Async<Hako> }
+         * @param <type> {String} Hako类型
+         * @param <path> {String} Hako的工作目录
+         * @param <usage> {String} Hako的用途
+         * @param <settings> {Object} Hako的配置
+         * @param <restart> {Boolean} 是否强制重启
+         */
+        HakoManager.prototype.startHako = function (type, path, usage, settings, restart) {
+        
+            var manager = this;
+        
+            if (usage && !settings.hakoJSON) {
+                settings.hakoJSON = @path(path, "conf" , `hako.${usage}.json`);
+                if (!@.fs.exists.file(settings.hakoJSON)){
+                    delete settings.hakoJSON;
+                }
+            }
+        
+            const id = Hako.getHakoID(type, path, usage);
+        
+            @debug(`Starting managed hako: ${@.jsonize({
+                "type": type,
+                "path": path,
+                "usage": usage,
+                "settings": settings
+            })}`);
+        
+            return this.ready().then(function () {
+        
+                return @.lock(manager, function () {
+        
+                    return @.async(function () {
+        
+                        if ((!manager.hakos[id]) || (!manager.hakos[id].online)) {
+                            this.next(); return;
+                        }
+        
+                        if (!restart) {
+                            this.next(manager.hakos[id]); return;
+                        }
+        
+                        manager.hakos[id].stop().resolve().pipe(this);
+        
+                    }).then(function (hako) {
+        
+                        if (hako) {
+                            @info(`Hako[${hako.id}] is already started`);
+                            hako.ready().resolve(hako).pipe(this); return;
+                        }
+        
+                        manager.hakos[id] = Hako.start(manager, type, path, usage, settings);
+        
+                        manager.hakos[id].ready().resolve(manager.hakos[id]).pipe(this);
+        
+                    });
+        
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Manager] 终止Hako任务
+         * @call {(pattern) -> Async<[Hako ...]> }
+         * @call {(pid) -> Async<[Hako ...]> }
+         * @call {(id) -> Async<[Hako ...]> }
+         * @param <pattern> {String} Hako ID中需要包含的字符串，或进程ID
+         * @param <pid> {Number} Hako的进程ID
+         * @param <id> {String} Hako的ID
+         */
+        HakoManager.prototype.stopHakos = function (id) {
+        
+            var manager = this;
+        
+            return this.ready().then(function () {
+        
+                return @.lock(manager, function () {
+        
+                    let idType = typeof id;
+        
+                    let hakos = [];
+                    switch (typeof id) {
+                        case "string": {
+                            if (manager.hakos[id]) {
+                                hakos.push(manager.hakos[id]);
+                            } else {
+                                for (let key in manager.hakos) {
+                                    let hako = manager.hakos[key];
+                                    if (hako.pid + "" === id) {
+                                        hakos.push(hako);
+                                    }
+                                }
+                            }
+                            if (hakos.length === 0) {
+                                for (let key in manager.hakos) {
+                                    let hako = manager.hakos[key];
+                                    if (hako.online && (key.indexOf(id) !== -1)) {
+                                        hakos.push(hako);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        case "number": {
+                            for (let key in manager.hakos) {
+                                let hako = manager.hakos[key];
+                                if (hako.online && (hako.pid + "" === id + "")) {
+                                    hakos.push(hako);
+                                }
+                            }
+                            break;
+                        }
+                        case "object": {
+                            if ((typeof id.type !== "string") || (typeof id.path !== "string")) {
+                                throw new Error("Unknown format of hako ID");
+                            }
+                            id = Hako.getHakoID(id.type, id.path, id.usage);
+                            if (manager.hakos[id]) {
+                                hakos.push(manager.hakos[id]);
+                            }
+                            break;
+                        }
+                    }
+        
+                    if (hakos.length === 0) {
+                        throw new Error(`Hako[${id}] not found`);
+                    }
+        
+                    @debug(`Stopping hakos matches ${id}`);
+        
+                    return @.async.all(hakos, function (hako) {
+        
+                        hako.stop().pipe(this);
+        
+                    }).resolve(hakos);
+        
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Manager] 重启Hako任务
+         * @call {(pattern) -> Async<[Hako ...]> }
+         * @call {(pid) -> Async<[Hako ...]> }
+         * @call {(id) -> Async<[Hako ...]> }
+         * @param <pattern> {String} Hako ID中需要包含的字符串，或进程ID
+         * @param <pid> {Number} Hako的进程ID
+         * @param <id> {String} Hako的ID
+         */
+        HakoManager.prototype.restartHakos = function (id) {
+        
+            var manager = this;
+        
+            return this.ready().then(function () {
+        
+                return @.lock(manager, function () {
+        
+                    let idType = typeof id;
+        
+                    let hakos = [];
+                    switch (typeof id) {
+                        case "string": {
+                            if (manager.hakos[id]) {
+                                hakos.push(manager.hakos[id]);
+                            } else {
+                                for (let key in manager.hakos) {
+                                    let hako = manager.hakos[key];
+                                    if (hako.pid + "" === id) {
+                                        hakos.push(hako);
+                                    }
+                                }
+                            }
+                            if (hakos.length === 0) {
+                                for (let key in manager.hakos) {
+                                    let hako = manager.hakos[key];
+                                    if (key.indexOf(id) !== -1) {
+                                        hakos.push(hako);
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        case "number": {
+                            for (let key in manager.hakos) {
+                                let hako = manager.hakos[key];
+                                if (hako.pid + "" === id + "") {
+                                    hakos.push(hako);
+                                }
+                            }
+                            break;
+                        }
+                        case "object": {
+                            if ((typeof id.type !== "string") || (typeof id.path !== "string")) {
+                                throw new Error("Unknown format of hako ID");
+                            }
+                            id = Hako.getHakoID(id.type, id.path, id.usage);
+                            if (manager.hakos[id]) {
+                                hakos.push(manager.hakos[id]);
+                            }
+                            break;
+                        }
+                    }
+        
+                    if (hakos.length === 0) {
+                        throw new Error(`Hako[${id}] not found`);
+                    }
+        
+                    @debug(`Restarting hakos matches ${id}`);
+        
+                    return @.async.all(hakos, function (hako) {
+        
+                        hako.stop().then(function () {
+        
+                            hako.start().pipe(this);
+        
+                        }).pipe(this);
+        
+                    }).resolve(hakos);
+        
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Manager] 更新Hako状态
+         * @call {() -> Async}
+         */
+        HakoManager.prototype.refreshHakos = function () {
+        
+            var manager = this;
+        
+            return this.ready().then(function () {
+        
+                return @.lock(manager, function () {
+        
+                    let snapshots = undefined;
+        
+                    return @.async(function () {
+        
+                        snapshotProcessList().then(function (result) {
+                            snapshots = result;
+                            this.next();
+                        }).pipe(this);
+        
+                    }).then(function () {
+        
+                        @.async.all(Object.keys(manager.hakos), function (id) {
+        
+                            const hako = manager.hakos[id];
+        
+                            if (hako.detached) {
+        
+                                @debug(`Checking detached[${hako.pid}] hako[${hako.id}]`);
+                                if (snapshots[hako.pid] && (snapshots[hako.pid].command === hako.info.command)) {
+                                    this.next(); return;
+                                }
+        
+                                @debug(`Detached hako[${hako.id}] is offline`);
+                                if (!hako.settings.autorestart) {
+                                    hako.stop().pipe(this); return;
+                                }
+        
+                                @debug(`Restart hako[${hako.id}]`);
+                                hako.stop().then(function () {
+                                    hako.start().pipe(this);
+                                }).pipe(this);
+        
+                                return;
+        
+                            }
+        
+                            if ((!hako.online) && (Date.now() - hako.lastUpdate > 60000)) {
+                                @info(`Releasing hako[${hako.id}]`)
+                                delete manager.hakos[hako.id];
+                            }
+        
+                            this.next();
+        
+                        }).pipe(this);
+        
+                    });
+        
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Server] [请求:GET] 测试Hako服务器是否活跃
+         * @function <server.ping>
+         */
+        serverCommandHandlers["ping"] = function (request, response, manager) {
+        
+            response.writeHead(200);
+            response.end("pong", (error) => {
+                // Do nothing
+            });
+        
+        };
+        
+        /**
+         * [内部:Server] [请求:GET] 获得服务器Hako列表
+         * @function <server.status>
+         * @call {() -> {manager, hakos}}
+         * @result <manager> {{pid, uptime, url}}
+         * @result <hakos> {[{online, pid, type, id, autorestart, path}]}
+         *     @param <online> {Boolean} Hako是否在线
+         *     @param <pid> {Number} Hako的进程ID
+         *     @param <type> {String} Hako的类型
+         *     @param <id> {String} Hako的全局ID
+         *     @param <autorestart> {Boolean} Hako是否在异常终止后自动重启
+         *     @param <path> {String} Hako的工作目录
+         */
+        serverCommandHandlers["status"] = function (request, response, manager) {
+        
+            let json = {
+                "manager": {
+                    "pid": process.pid,
+                    "uptime": Date.now() - manager.startTime,
+                    "url": manager.url
+                }
+            };
+        
+            return manager.listHakos().then(function (hakos) {
+        
+                json.hakos = hakos;
+        
+                response.end(JSON.stringify(json), (error) => {
+                    if (error) {
+                        @error(error);
+                    }
+                });
+        
+                this.next();
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Server] [请求:POST] 请求开启Hako
+         * @function <server.start>
+         */
+        serverCommandHandlers["start"] = function (request, response, manager) {
+        
+            return @.stream.json(request).then(function (data) {
+        
+                return manager.startHako(data.type, data.path, data.usage, data.settings, data.restart).then(function (hako) {
+        
+                    response.writeHead(200);
+        
+                    response.end(JSON.stringify(hako.info), this.test);
+        
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Server] [请求:POST] 请求重启Hako
+         * @function <server.restart>
+         */
+        serverCommandHandlers["restart"] = function (request, response, manager) {
+        
+            return @.stream.json(request).then(function (data) {
+        
+                return manager.restartHakos(data).then(function (hakos) {
+        
+                    response.writeHead(200);
+        
+                    response.end(JSON.stringify(hakos.map((hako) => hako.info)), this.test);
+        
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Server] [请求:POST] 请求终止Hako
+         * @function <server.stop>
+         */
+        serverCommandHandlers["stop"] = function (request, response, manager) {
+        
+            return @.stream.json(request).then(function (data) {
+        
+                return manager.stopHakos(data).then(function (hakos) {
+        
+                    response.writeHead(200);
+        
+                    response.end(JSON.stringify(hakos.map((hako) => hako.info)), this.test);
+        
+                });
+        
+            });
+        
+        };
+        
+        module.exports.connectManager = connectManager;
+        module.exports.constructManager = constructManager;
+        module.exports.shutdownManager = shutdownManager
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/lib/mewchan.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const resolveMewchanJSON = function (switches, path) {
+        
+            path = @path(path);
+        
+            let isChan = @.fs.exists.file(path) && @.fs.extname(path) === ".chan";
+        
+            let paths = [path];
+            if ((!isChan) && @.fs.exists.dir(@path(path, "lib"))) {
+                let chans = @.fs.listFiles(@path(path, "lib")).filter((record) => {
+                    return (@.fs.extname(record.name) === ".chan") && (record.type === "file");
+                });
+                for (let record of chans) {
+                    paths.push(@path(path, "lib", record.name));
+                }
+            }
+        
+            const handler = @.chan.mount.union(paths, switches.settings.presets, {});
+            const unionPath = handler.fs.root;
+        
+            return @.async(function () {
+        
+                try {
+                    handler.require(@path(unionPath, "conf/mewchan.json"));
+                } catch (error) {
+                    throw new Error(`No mewchan found at path ${path}`);
+                }
+        
+                let usage = switches.settings.usage;
+                let possibleUsages = Object.create(null);
+                let hakoJSONPaths = [];
+                if (switches.settings.hakoJSON) {
+                    for (let jsonPath of switches.settings.hakoJSON) {
+                        let hakoJSONPath = @path(jsonPath);
+                        if (!@.fs.exists.file(hakoJSONPath)) {
+                            if (/[\/\\\?\*:]/.test(jsonPath)) {
+                                throw new Error(`No hako.json found at path ${hakoJSONPath}`);
+                            }
+                            if (isChan) {
+                                hakoJSONPath = @path(path, `../hako.${jsonPath}.json`);
+                            } else {
+                                hakoJSONPath = @path(path, `conf/hako.${jsonPath}.json`);
+                            }
+                            if (!@.fs.exists.file(hakoJSONPath)) {
+                                throw new Error(`No hako.json found at path ${hakoJSONPath}`);
+                            }
+                            let possibleUsage = @.fs.basename(hakoJSONPath);
+                            if (possibleUsage.slice(0, 5).toLowerCase() === "hako.") {
+                                possibleUsage = possibleUsage.slice(5);
+                            }
+                            possibleUsages[possibleUsage] = true;
+                        }
+                        hakoJSONPaths.push(hakoJSONPath);
+                    }
+                } else if (switches.settings.usage) {
+                    let hakoJSONPath = undefined;
+                    if (isChan) {
+                        hakoJSONPath = @path(path, `../hako.${switches.settings.usage}.json`);
+                    } else {
+                        hakoJSONPath = @path(path, `conf/hako.${switches.settings.usage}.json`);
+                    }
+                    if (@.fs.exists.file(hakoJSONPath)) {
+                        hakoJSONPaths.push(hakoJSONPath);
+                    }
+                } else {
+                    if (isChan) {
+                        hakoJSONPath = @path(path, "../hako.json");
+                    } else {
+                        hakoJSONPath = @path(path, "conf/hako.json");
+                    }
+                    if (@.fs.exists.file(hakoJSONPath)) {
+                        hakoJSONPaths.push(hakoJSONPath);
+                    }
+                }
+        
+                if (!usage) {
+                    let keys = @.keys(possibleUsages);
+                    if (keys.length > 0) {
+                        usage = keys.join("_");
+                    }
+                }
+        
+                let hakoJSONs = [];
+                if (hakoJSONPaths) {
+                    for (let hakoJSONPath of hakoJSONPaths) {
+                        try {
+                            hakoJSONs.push(JSON.parse(@.fs.readFile.sync(hakoJSONPath).toString("utf8")));
+                        } catch (error) {
+                            throw new Error(`Failed to parse hako.json at ${hakoJSONPath}`);
+                        }
+                    }
+                }
+        
+                let mewchanJSON = undefined;
+                try {
+                    mewchanJSON = handler.require(@path(unionPath, "conf/mewchan.json"));
+                } catch (error) {
+                    throw new Error(`Failed to parse mewchan.json`);
+                }
+        
+                let jsons = hakoJSONs.slice(0);
+                if (mewchanJSON) {
+                    jsons.unshift(mewchanJSON);
+                }
+        
+                let jsonRules = {
+        
+                    "name": { "!valueType": "string", "!defaultValue": "mewchan" },
+                    "domain": { "!valueType": "string", "!defaultValue": "cn.mewmew.mewchan.untitled" },
+                    "author": { "!valueType": "string", "!defaultValue": "annoymous" },
+                    "description": { "!valueType": "string", "!defaultValue": "A wild mewchan appeared" },
+                    "company": { "!valueType": "string" },
+                    "website": { "!valueType": "string" },
+        
+                    "brainPath": { "!valueType": "string", "!defaultValue": "brain" },
+                    "brainOptions": { "!valueType": "object", "!defaultValue": {} },
+        
+                    "kitties": {
+                        "!valueType": "object",
+                        "!defaultValue": {}
+                    },
+        
+                    "playgrounds": {
+                        "!valueType": "object",
+                        "!defaultValue": {}
+                    },
+                    "resources": {
+                        "!valueType": "object",
+                        "!defaultValue": {}
+                    },
+        
+                    "printMascot": { "!valueType": "boolean", "!defaultValue": true },
+                    "logInternalMews": { "!valueType": "boolean", "!defaultValue": false },
+                    "logOnlyMewUsage": { "!valueType": "boolean", "!defaultValue": false },
+                    "logMewWithUsages": {
+                        "!valueType": "array", "!autoresolveArray": true,
+                        "!arrayElement": { "!valueType": "regex-asterisk-dot" }
+                    },
+        
+                    "defaultMewTimeout": { "!valueType": "number", "!defaultValue": 5000 },
+        
+                    "interpreters": { "!valueType": "object", "!defaultValue": {} },
+        
+                };
+        
+                let possibleKittyFactories = Object.create(null);
+                for (let json of jsons) {
+                    if (json.kitties) {
+                        for (let key in json.kitties) {
+                            possibleKittyFactories[key.split(".")[0]] = true;
+                        }
+                    }
+                }
+        
+                for (let kitty in possibleKittyFactories) {
+                    // mewchanJSON = handler.require(@path(unionPath, "conf/mewchan.json"));
+                    if (!handler.fs.existsSync(@path(unionPath, "kitties", kitty))) {
+                        throw new Error(`Kitty factory[${kitty}] not found`);
+                    }
+                    if (handler.fs.existsSync(@path(unionPath, "kitties", kitty, "kitty.json"))) {
+                        let kittyJSON = undefined;
+                        try {
+                            kittyJSON = handler.require(@path(unionPath, "kitties", kitty, "kitty.json"));
+                        } catch (error) {
+                            @error(`Failed to parse kitty.json of factory[${kitty}]`);
+                        }
+                        if (kittyJSON && kittyJSON.options) {
+                            jsonRules.kitties[kitty] = @.merge(kittyJSON.options);
+                        }
+                    }
+                }
+        
+                let json = @.merge.advanced.apply(@.merge, [jsonRules].concat(jsons));
+                let hakoJSON = @.merge.advanced.apply(@.merge, [jsonRules].concat(hakoJSONs));
+        
+                let factories = Object.create(null);
+        
+                let kitties = @.keys(json.kitties);
+        
+                for (let kitty of kitties) {
+                    factories[kitty.split(".")[0]] = true;
+                }
+        
+                let kittyDir = @path(unionPath, "kitties");
+                let dirs = [];
+                if (handler.fs.existsSync(kittyDir)) {
+                    dirs = handler.fs.readdirSync(kittyDir, { "withFileTypes": true }).filter((dirent) => {
+                        return dirent.isDirectory() && (dirent.name[0] !== ".");
+                    }).filter((dirent) => dirent.name);
+                }
+        
+                if (switches.settings.allKitties) {
+                    for (let kitty of dirs) {
+                        if (!factories[kitty]) {
+                            kitties.push(kitty);
+                            factories[kitty] = true;
+                        }
+                    }
+                }
+        
+                this.next(kitties, factories, json, hakoJSON, usage, handler);
+        
+            });
+        
+        };
+        
+        module.exports.resolveMewchanJSON = resolveMewchanJSON
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    jsFiles["src/lib/process.js"] = function (module, exports, require, __dirname, __filename, __exports) {
+
+        const childProcess = require("child_process");
+        const fs = require("fs");
+        
+        
+        /**
+         * [内部:Process] 执行命令（不支持Windows下执行脚本文件）
+         * @call {(command, switches) -> Async<stdout, stderr>}
+         * @call {(command, switches, cwd) -> Async<stdout, stderr>}
+         * @call {(command, switches, cwd, env) -> Async<stdout, stderr>}
+         * @param <command> {String} 命令
+         * @param <switches> {[String]} 命令参数
+         * @param <cwd> {String} [可选] [可空] 工作目录
+         * @param <env> {Object} [可选] [可空] 环境变量
+         * @result <stdout> {String} 命令stdout输出
+         * @result <stderr> {String} 命令stderr输出
+         */
+        const executeCommand = function (command, switches, cwd, env) {
+        
+            return @.async(function () {
+        
+                var options = {
+                    "cwd": cwd ? cwd : process.cwd(),
+                    "env": Object.assign({}, process.env, env ? env : {}),
+                    "windowsHide": true
+                };
+        
+                var spawned = childProcess.spawn(command, switches, options);
+        
+                var stdout = [];
+                var stderr = [];
+        
+                spawned.stdout.on("data", (data) => {
+                    stdout.push(data);
+                });
+        
+                spawned.stderr.on("data", (data) => {
+                    stderr.push(data);
+                });
+        
+                spawned.on("close", (code, signal) => {
+        
+                    if (code !== 0) {
+        
+                        var error  = new Error(`Failed to execute command ${command}`)
+                        error.code = code;
+        
+                        this.reject(error);
+                        return;
+                    }
+        
+                    this.next(Buffer.concat(stdout), Buffer.concat(stderr));
+        
+                });
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Process] 执行命令（支持Windows下执行脚本文件）
+         * @call {(command, switches) -> Async<stdout, stderr>}
+         * @call {(command, switches, cwd) -> Async<stdout, stderr>}
+         * @call {(command, switches, cwd, env) -> Async<stdout, stderr>}
+         * @param <command> {String} 命令
+         * @param <switches> {[String]} 命令参数
+         * @param <cwd> {String} [可选] [可空] 工作目录
+         * @param <env> {Object} [可选] [可空] 环境变量
+         * @result <stdout> {String} 命令stdout输出
+         * @result <stderr> {String} 命令stderr输出
+         */
+        const executeShell = function (command, switches, cwd, env) {
+        
+            if (!cwd) {
+                cwd = process.cwd();
+            }
+        
+            if (env) {
+                env = Object.assign({}, process.env, env);
+            } else {
+                env = Object.assign({}, process.env);
+            }
+        
+            const execution = prepareExecution(command, switches, cwd, env);
+        
+            return executeCommand(execution.command, execution.switches, cwd, env);
+        
+        };
+        
+        /**
+         * [内部:Process] 同步执行命令
+         * @call {(command, switches) -> stdout}
+         * @call {(command, switches, cwd) -> stdout}
+         * @call {(command, switches, cwd, env) -> stdout}
+         * @param <command> {String} 命令
+         * @param <switches> {[String]} 命令参数
+         * @param <cwd> {String} [可选] [可空] 工作目录
+         * @param <env> {Object} [可选] [可空] 环境变量
+         * @result <stdout> {String} 命令stdout输出
+         */
+        const executeCommandSync = function (command, switches, cwd, env) {
+        
+            var spawned = childProcess.spawnSync(command, switches, {
+                "cwd": cwd ? cwd : process.cwd(),
+                "env": Object.assign({}, process.env, env ? env : {}),
+                "windowsHide": true
+            });
+        
+            if (spawned.status !== 0) {
+                throw new Error(`Command error: ${spawned.status}`);
+            }
+        
+            return spawned.stdout.toString("utf8").trim();
+        
+        };
+        
+        // TODO: use the mew_util sheband resolutions
+        const resolveCommandShebang = function (command, cwd, env) {
+        
+            if (/^[\\\/]/.test(command) && @.os.inMSYS()) {
+                command = executeCommandSync("cygpath", [command, "-w"]);
+            }
+        
+            command = @realpath(command);
+        
+            let origin = command;
+        
+            let fd = fs.openSync(command, "r");
+            let size = Math.min(fs.fstatSync(fd).size, 256);
+            let buffer = Buffer.alloc(size);
+            let read = fs.readSync(fd, buffer, 0, size, 0);
+        
+            fs.closeSync(fd);
+        
+            if ((read > 2) && (buffer[0] === 35) && (buffer[1] === 33)) {
+        
+                let shebang = buffer.slice(0, read).toString("ascii").split(/\r|\n/)[0].slice(2);
+                if (shebang.split(/\s/)[0] === "/usr/bin/env") {
+                    shebang = shebang.slice("/usr/bin/env".length).trim();
+                }
+                command = shebang.split(/\s/)[0];
+                if ((command === "mew_js") && @.os.inMSYS()) {
+                    // MSYS has an extra shell to support interactive mode, so skip it to find the exe one
+                    command = "mew_js.exe";
+                }
+                // TODO: support complex sheband, currenty we only support simple
+                let arguments = shebang.slice(command.length).trim().split(/\s+/);
+                if ((arguments.length === 1) && (!arguments[0])) {
+                    arguments = [];
+                }
+                arguments = [origin].concat(arguments);
+        
+                if (!/[\\\/]/.test(command)) {
+                    return getCommandProgram(command, cwd, env).concat(arguments);
+                }
+        
+                // resolve shebang again to if the new command is still a shebang program
+                return resolveCommandShebang(command, cwd, env).concat(arguments);
+        
+            }
+        
+            return [command];
+        };
+        
+        /**
+         * [内部:Process] 查找与解析命令Shebang，主要针对不支持Shebang的Windows系统
+         * @call {(command) -> [command, switch ...]}
+         * @call {(command, cwd) -> [command, switch ...]}
+         * @call {(command, cwd, env) -> [command, switch ...]}
+         * @param <command> {String} 命令
+         * @param <cwd> {String} [可选] [可空] 工作目录
+         * @param <env> {Object} [可选] [可空] 环境变量
+         * @result <command> {String} 最终执行命令
+         * @result <switch> {String} 最终执行附带的参数
+         */
+        const getCommandProgram = function (command, cwd, env) {
+        
+            if (@.os.is.windows()) {
+                command = executeCommandSync("where", [command]).split(/\r|\n/)[0];
+            } else {
+                command = executeCommandSync("which", [command]).trim();
+            }
+        
+            let resolved = resolveCommandShebang(command);
+        
+            if (@.os.inMSYS()) {
+                resolved[0] = executeCommandSync("cygpath", [resolved[0], "-w"]);
+            }
+        
+            return resolved;
+        
+        };
+        
+        /**
+         * [内部:Process] 获得对应PID进程的Command
+         * @call {(pid) -> Async<{pid, command}>}
+         * @param <pid> {Number} 进程PID
+         * @result <command> {String} 完整命令
+         * @result <pid> {Number} 进程PID
+         */
+        const getProcessInfo = function (pid) {
+        
+            return snapshotProcessList(pid).then(function (snapshot) {
+        
+                if (!snapshot[pid]) {
+                    throw new Error(`Process not found with PID[${pid}]`);
+                }
+        
+                this.next(snapshot[pid]);
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Process] 结束特定PID的进程
+         * @call {(pid, childProcess) -> Async}
+         * @param <pid> {Number} 进程PID
+         * @param <childProcess> {Process} 子进程实例
+         */
+        const killProcess = function (pid, childProcess) {
+        
+            return @.async(function () {
+        
+                if (childProcess && (!childProcess.killed)) {
+                    childProcess.removeAllListeners("exit");
+                    childProcess.kill("SIGKILL");
+                }
+        
+                getProcessInfo(pid).catch(this);
+        
+            }).then(function (error, info) {
+        
+                if (error) {
+                    this.next(); return;
+                }
+        
+                const startDate = Date.now();
+                try {
+                    process.kill(pid, "SIGKILL");
+                } catch (error) {
+                    // Do nothing
+                }
+        
+                const checkPID = (next) => {
+                    getProcessInfo(pid).finished((error, info2) => {
+        
+                        if (error || (info2.command !== info.command)) {
+                            this.next(); return;
+                        }
+        
+                        if (Date.now() - startDate < 30000) {
+                            next(); return;
+                        }
+        
+                        let command = ["kill", ["-9", pid]];
+                        if (@.os.is.windows()) {
+                            command = ["taskkill", ["/pid", pid]];
+                        }
+        
+                        executeCommand(command[0], command[1]).finished((error, stdout, stderr) => {
+                            @.delay(1000, next);
+                        });
+        
+                    });
+                };
+        
+                checkPID(() => {
+                    @.schedule(1000, function () {
+                        checkPID(this.schedule.bind(this));
+                    });
+                });
+        
+            });
+        
+        };
+        
+        const spawnMewJS = function () {
+        
+        };
+        
+        /**
+         * [内部:Process] 提前分析和解析需要执行的命令
+         * @call {(command, switches, cwd, env) -> {command, switches}}
+         * @param <command> {String} 期望执行的命令
+         * @param <switches> {[String]} 期望执行命令的参数
+         * @param <cwd> {String} 工作目录
+         * @param <env> {Object} 环境参数
+         * @result <command> {String} 解析后实际执行的命令
+         * @result <switches> {[String]} 解析后实际执行的命令参数
+         */
+        const prepareExecution = function (command, switches, cwd, env) {
+        
+            let program = getCommandProgram(command, cwd, env);
+        
+            return {
+                "command": program[0],
+                "switches": program.slice(1).concat(switches)
+            };
+        
+        };
+        
+        /**
+         * [内部:Process] 启动一个全新的hako命令
+         * @call {(commands, options, settings, fds, cwd, env) -> {Async<{process, command}>}}
+         * @param <commands> {[String]} 期望执行的hako命令
+         * @param <options> {Object} 期望hako命令附带的选项, `-`开头的输入
+         * @param <settings> {Object} 期望hako命令附带的设置，`--`开头的输入
+         * @param <fds> {{stdout, stderr}} 输出FD
+         * @param <cwd> {String} 工作目录
+         * @param <env> {Object} 环境参数
+         * @result <process> {Process} 子进程实例
+         * @result <command> {String} 子进程实际执行的命令
+         */
+        const spawnHako = function (commands, options, settings, fds, cwd, env) {
+        
+            const hakoCommand = getCommandProgram("hako", cwd, env);
+            let mewJS = @realpath(process.argv[0]);
+            let hako = @realpath(process.argv[1]);
+            if ((hakoCommand[0] !== mewJS) || (hakoCommand[1] !== hako)) {
+                let message = "Hako command not match";
+                if (hakoCommand[0] !== mewJS) {
+                    @error(`Expected mew_js as: \`${mewJS}\`\n` +
+                           `           but got: \`${hakoCommand[0]}\``);
+                }
+                if (hakoCommand[1] !== hako) {
+                    @error(`Expected hako as: \`${hako}\`\n` +
+                           `         but got: \`${hakoCommand[1]}\``);
+                }
+                return @.async.reject(new Error(message));
+            }
+        
+            let switches = commands.slice(0);
+        
+            for (let key in options) {
+                if (options[key] !== undefined) {
+                    if (options[key] instanceof Array) {
+                        for (item of options[key]) {
+                            switches.push(`-${key}[]=${item}`);
+                        }
+                    } else {
+                        switches.push(`-${key}=${options[key]}`);
+                    }
+                }
+            }
+        
+            for (let key in settings) {
+                if (settings[key] !== undefined) {
+                    if (settings[key] instanceof Array) {
+                        for (item of settings[key]) {
+                            switches.push(`--${key}[]=${item}`);
+                        }
+                    } else {
+                        switches.push(`--${key}=${settings[key]}`);
+                    }
+                }
+            }
+        
+            return spawnProcess("hako", switches, cwd, env, fds);
+        
+        };
+        
+        /**
+         * [内部:Process] 启动一个子进程运行命令行
+         * @call {(command, switches, cwd, env, fds) -> {Async<{process, command}>}}
+         * @param <command> {String} 期望执行的命令
+         * @param <switches> {[String]} 期望执行的命令参数
+         * @param <cwd> {String} 工作目录
+         * @param <env> {Object} 环境参数
+         * @param <fds> {{stdout, stderr}} 输出FD
+         * @result <process> {Process} 子进程实例
+         * @result <command> {String} 子进程实际执行的命令
+         */
+        const spawnProcess = function (command, switches, cwd, env, fds) {
+        
+            const execution = prepareExecution(command, switches);
+        
+            const options = {
+                "cwd": cwd ? cwd : process.cwd(),
+                "env": Object.assign({}, process.env, env),
+                "windowsHide": true
+            };
+        
+            if (fds) {
+                options.stdio = ["ipc", fds.stdout, fds.stderr];
+                options.detached = true;
+            }
+        
+            var spawned = childProcess.spawn(execution.command, execution.switches, options);
+        
+            if (!fds) {
+                spawned.stdout.on("data", (data) => {
+                    process.stdout.write(data);
+                });
+                spawned.stderr.on("data", (data) => {
+                    process.stderr.write(data);
+                });
+            }
+        
+            spawned.unref();
+        
+            return @.async(function () {
+        
+                getProcessInfo(spawned.pid).catch(this);
+        
+            }).then(function (error, info) {
+        
+                let summary = {
+                    "process": spawned
+                };
+        
+                if ((!error) && info) {
+                    summary.command = info.command;
+                }
+        
+                this.next(summary);
+        
+            });
+        
+        };
+        
+        /**
+         * [内部:Process] 获得进程列表
+         * @call {() -> Async<[{pid, command}]>}
+         * @call {(pid) -> Async<[{pid, command}]>}
+         * @param <pid> {Number} [可选] [可空] 需要查询的进程ID
+         * @result <pid> {Number} 进程ID
+         * @result <command> {String} 进程实际运行的命令行
+         */
+        const snapshotProcessList = function (pid) {
+        
+            if (@.os.is.windows()) {
+        
+                return @.async(function () {
+        
+                    let switches = ["process"];
+                    if (pid) {
+                        switches.push("where", "ProcessId=" + pid);
+                    }
+                    switches.push("get", "ProcessId,CommandLine");
+        
+                    executeCommand("wmic", switches).pipe(this);
+        
+                }).then(function (stdout) {
+        
+                    const lines = stdout.toString("ascii").split("\n");
+        
+                    let headers = lines[0].split(/\s[^\s]/);
+        
+                    let processes = Object.create(null);
+        
+                    lines.slice(1).forEach((line) => {
+                        let command = line.slice(0, headers[0].length).trim();
+                        let pid = parseInt(line.slice(headers[0].length).trim());
+                        if (isFinite(pid)) {
+                            processes[pid] = {
+                                "command": command,
+                                "pid": pid
+                            };
+                        }
+                    });
+        
+                    this.next(processes);
+        
+                })
+        
+            } else {
+        
+                return @.async(function () {
+        
+                    // if (pid) {
+                    //     executeCommand("ps", ["-p", pid]).pipe(this);
+                    // } else {
+                        executeCommand("ps", ["ax"]).pipe(this);
+                    // }
+        
+                }).then(function (stdout) {
+        
+                    const lines = stdout.toString("ascii").split("\n");
+        
+                    let pidIndex = lines[0].indexOf("PID") + 3;
+                    let commandIndex = lines[0].indexOf("COMMAND");
+                    if (commandIndex === -1) {
+                        commandIndex = lines[0].indexOf("CMD");
+                    }
+                    if ((pidIndex === -1) || (commandIndex === -1)) {
+                        throw new Error("Unknown PS output");
+                    }
+        
+                    let processes = Object.create(null);
+        
+                    lines.slice(1).forEach((line) => {
+                        let pid = parseInt(line.slice(0, pidIndex).trim());
+                        let command = line.slice(commandIndex).trim();
+                        if (isFinite(pid)) {
+                            processes[pid] = {
+                                "pid": pid,
+                                "command": command
+                            };
+                        }
+                    });
+        
+                    this.next(processes);
+        
+                });
+        
+            }
+        
+        };
+        
+        module.exports.executeCommand = executeCommand;
+        module.exports.executeCommandSync = executeCommandSync;
+        
+        module.exports.executeShell = executeShell;
+        
+        module.exports.spawnMewJS = spawnMewJS;
+        module.exports.spawnHako = spawnHako;
+        module.exports.spawnProcess = spawnProcess;
+        
+        module.exports.killProcess = killProcess;
+        
+        module.exports.getProcessInfo = getProcessInfo;
+        module.exports.snapshotProcessList = snapshotProcessList;
+        module.exports.executeCommand  = executeCommand;
+        module.exports.executeCommandSync  = executeCommandSync
+
+        if (exports !== __exports) {
+            module.exports = exports;
+        }
+
+    };
+
+
+    resources["etc/hako/init/bot/default.command.js"] = Buffer.from("bW9kdWxlLmV4cG9ydHMgPSB7CiAgICAiZGVwcyI6IHt9LAogICAgImJ1aWxkIjogWwogICAgICAgIFsibWV3X2NoYW4iXQogICAgXSwKICAgICJkaXN0cyI6IHt9Cn07Cg==", "base64");
+
+
+    resources["etc/hako/init/bot/default.js"] = Buffer.from("bW9kdWxlLmV4cG9ydHMgPSB7CiAgICAiZGVwcyI6IHt9LAogICAgImJ1aWxkIjogWwogICAgXSwKICAgICJkaXN0cyI6IHt9Cn07Cg==", "base64");
+
+
+    resources["etc/hako/init/bot/doc.js"] = Buffer.from("bW9kdWxlLmV4cG9ydHMgPSB7CiAgICAiZGVwcyI6IHt9LAogICAgImJ1aWxkIjogWwogICAgICAgIFsibWV3X2RvYyJdCiAgICBdLAogICAgImRpc3RzIjoge30KfTsK", "base64");
+
+
+    resources["etc/hako/init/brain/index.js"] = Buffer.from("QGNlbGVicigiSGVsbG8sIHdvcmxkISIpOwo=", "base64");
+
+
+    resources["etc/hako/init/conf/chan.command.json"] = Buffer.from("ewogICAgIm5hbWUiOiAiJHtuYW1lfSIsCiAgICAiZGVzY3JpcHRpb24iOiAiJHtuYW1lfSBoYWtvIGNvbW1hbmQgcGFja2FnZSIsCiAgICAidmVyc2lvbiI6ICIwLjEuMCIsCiAgICAiYnVpbGQiOiAiMCIsCiAgICAiYXV0aG9yIjogIiR7dXNlcn0iLAogICAgInJlc291cmNlRmlsdGVycyI6IFtdLAogICAgImlnbm9yZUZpbHRlcnMiOiBbCiAgICAgICAgImJvdC8vKiIsCiAgICAgICAgImJpbi8vKiIsCiAgICAgICAgImJ1aWxkLy8qIiwKICAgICAgICAiZGlzdC8vKiIsCiAgICAgICAgInRlc3QvLyoiCiAgICBdLAogICAgIm1haW5GaWxlIjogInNyYy9pbmRleC5qcyIKfQo=", "base64");
+
+
+    resources["etc/hako/init/conf/chan.json"] = Buffer.from("ewogICAgIm5hbWUiOiAiJHtuYW1lfSIsCiAgICAiZGVzY3JpcHRpb24iOiAiJHtuYW1lfSBjaGFuIHBhY2thZ2UiLAogICAgInZlcnNpb24iOiAiMC4xLjAiLAogICAgImJ1aWxkIjogIjAiLAogICAgImF1dGhvciI6ICIke3VzZXJ9IiwKICAgICJyZXNvdXJjZUZpbHRlcnMiOiBbXSwKICAgICJpZ25vcmVGaWx0ZXJzIjogWwogICAgICAgICJiaW4vLyoiLAogICAgICAgICJib3QvLyoiLAogICAgICAgICJkYXRhL2RvYy8vKiIsCiAgICAgICAgImRhdGEvbGliLy8qIiwKICAgICAgICAidGVzdC8vKiIsCiAgICAgICAgInVpL2J1aWxkLy8qIiwKICAgICAgICAidWkvbm9kZV9tb2R1bGVzLy8qIiwKICAgICAgICAidWkvc3JjLy8qIiwKICAgICAgICAidWkvcGFja2FnZS5qc29uIiwKICAgICAgICAidWkvcGFja2FnZS1sb2NrLmpzb24iCiAgICBdCn0K", "base64");
+
+
+    resources["etc/hako/init/conf/doc.json"] = Buffer.from("e30K", "base64");
+
+
+    resources["etc/hako/init/conf/hako.json"] = Buffer.from("e30K", "base64");
+
+
+    resources["etc/hako/init/conf/mewchan.json"] = Buffer.from("ewogICAgInBsYXlncm91bmRzIjogewogICAgICAgICJodHRwIjoge30KICAgIH0sCiAgICAicmVzb3VyY2VzIjogewogICAgICAgICJkZWZhdWx0IjogewogICAgICAgICAgICAicGxheWdyb3VuZCI6ICJodHRwIiwKICAgICAgICAgICAgImlubmVyUGF0aCI6ICJ1aSIsCiAgICAgICAgICAgICJvdXRlclBhdGgiOiAiLyIsCiAgICAgICAgICAgICJsb2NhbE9ubHkiOiB0cnVlLAogICAgICAgICAgICAiYXV0b0luZGV4IiA6IHRydWUKICAgICAgICB9CiAgICB9LAogICAgImtpdHRpZXMiOiB7fQp9Cg==", "base64");
+
+
+    resources["etc/hako/init/src/index.js"] = Buffer.from("Y29uc3QgZXhlY3V0ZUNvbW1hbmQgPSBmdW5jdGlvbiAoc3dpdGNoZXMpIHsKICAgIHJldHVybiBALmFzeW5jKGZ1bmN0aW9uICgpIHsKICAgICAgICBAY2VsZWJyKCJIZWxsbywgd29ybGQhIik7CiAgICB9KTsKfTsKCm1vZHVsZS5leHBvcnRzLmNvbW1hbmQgPSBleGVjdXRlQ29tbWFuZDsK", "base64");
+
+
+    resources["etc/hako/init/ui/index.mhtml"] = Buffer.from("PGh0bWw+PGJvZHk+PGgxPkl0IHdvcmtzITwvaDE+PC9ib2R5PjwvaHRtbD4K", "base64");
+
+
+    resources["etc/hako/init/gitignore"] = Buffer.from("IyBNYWNPUwouRFNfU3RvcmUKLkFwcGxlRG91YmxlCi5MU092ZXJyaWRlCi5fKgouRG9jdW1lbnRSZXZpc2lvbnMtVjEwMAouZnNldmVudHNkCi5TcG90bGlnaHQtVjEwMAouVGVtcG9yYXJ5SXRlbXMKLlRyYXNoZXMKLlZvbHVtZUljb24uaWNucwouQXBwbGVEQgouQXBwbGVEZXNrdG9wCgojIExpbnV4Ck5ldHdvcmsgVHJhc2ggRm9sZGVyClRlbXBvcmFyeSBJdGVtcwouYXBkaXNrCi5kaXJlY3RvcnkKCiMgV2luZG93cwpUaHVtYnMuZGIKCiMgSURFICYgRWRpdG9ycwouaWRlYQoqLnN1YmxpbWUtd29ya3NwYWNlCiouc3VibGltZS1wcm9qZWN0Ci5oaXN0b3J5Ci4qfgouc3dwCgojIE1ld0pTCmJ1aWxkCmNvbmYvaGFrby5qc29uCmRhdGEKZGlzdAo=", "base64");
+
+
+    resources["etc/hako/init/package.json"] = Buffer.from("ewogICAgIm5hbWUiOiAiJHtuYW1lfSIsCiAgICAidmVyc2lvbiI6ICIwLjEuMCIsCiAgICAiZGVzY3JpcHRpb24iOiAiJHtuYW1lfSBwYWNrYWdlIiwKICAgICJhdXRob3IiOiAiJHt1c2VyfSIsCiAgICAibWFpbiI6ICJzcmMvaW5kZXguanMiLAogICAgInNjcmlwdHMiOiB7fSwKICAgICJsaWNlbnNlIjogIklTQyIKfQo=", "base64");
+
+
+    resources["etc/upgrade/version.json"] = Buffer.from("ewogICAgInZlcnNpb24iIDogIjUuMC4wIgp9", "base64");
+
+
+    resources["dist/upgrade/version.json"] = Buffer.from("eyAKICAgICJ1cmwiOiAiaHR0cHM6Ly9zdGF0aWMubWV3Y2hhbi5jb20vaGFrb3Y1LTczOWQ2ZWU0OTY4NzhmZmUzZmFlYTMxYWJjNDE5N2Q2L2hha28uanNvbiIsIAogICAgInZlcnNpb24iOiAiNS4wLjAtMjAyMC0wOC0xMi1vdGhlcmZpeC00MjIxODc2YyIKfQ==", "base64");
+
+
+    module.exports = evaluate("./src/index.js");
+
+
+})();

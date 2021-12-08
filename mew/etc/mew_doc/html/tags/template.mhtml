@@ -1,0 +1,26 @@
+<html>
+    <head>
+        <meta charset="utf-8"/>
+        <title>${id}</title>
+        <link rel="stylesheet" href="../styles/base.css"/>
+        <link rel="stylesheet" href="../styles/page.css"/>
+        <link rel="stylesheet" href="../styles/tags.css"/>
+        <script src="../scripts/tag.js"></script>
+        <script src="../scripts/page.js"></script>
+    </head>
+    <body>
+        <h1>${id}</h1>
+        <tmpl:map list="apis">
+            <div class="tag-section" tag-parameter="${item.parameter}">
+                <tmpl:if test="item.parameter">
+                    <h2>${item.parameter}</h2>
+                </tmpl:if>
+                <ul>
+                    <tmpl:map list="item.entries" item-name="api">
+                        <li><a href="../${api.path}">${api.id}</a></li>
+                    </tmpl:map>
+                </ul>
+            </div>
+        </tmpl:map>
+    </body>
+</html>

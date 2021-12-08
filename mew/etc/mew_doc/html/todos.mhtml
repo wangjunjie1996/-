@@ -1,0 +1,34 @@
+<html>
+    <head>
+        <meta charset="utf-8"/>
+        <title>TODO</title>
+        <link rel="stylesheet" href="./styles/base.css"/>
+        <link rel="stylesheet" href="./styles/page.css"/>
+        <link rel="stylesheet" href="./styles/todos.css"/>
+        <script src="./scripts/page.js"></script>
+    </head>
+    <body class="todo">
+        <h1>TODO 列表</h1>
+        <p>生成时间：${formatDate(date(), 'YYYY年M月D日 hh:mm:ss')}</p>
+        <p>任务总量：${fold(keys(todos), 0, {$2 + todos[$1].length})}</p>
+        <tmpl:map list="keys(todos)" item-name="file">
+            <h2 class="todo-file-name">文件：${file} <span class="todo-count">${todos[file].length}</span></h2>
+            <table class="todo-list">
+                <thead>
+                    <tr>
+                        <th class="todo-line">行号</th>
+                        <th class="todo-content">任务说明</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tmpl:map list="todos[file]">
+                        <tr>
+                            <td class="todo-line">${item.line}</td>
+                            <td class="todo-content">$${item.content}</td>
+                        </tr>
+                    </tmpl:map>
+                </tbody>
+            </table>
+        </tmpl:map>
+    </body>
+</html>

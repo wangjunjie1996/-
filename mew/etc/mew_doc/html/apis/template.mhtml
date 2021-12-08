@@ -1,0 +1,13 @@
+<html>
+    <head>
+        <meta charset="utf-8"/>
+        <title>${id}</title>
+        <link rel="stylesheet" href="../styles/base.css"/>
+        <link rel="stylesheet" href="../styles/page.css"/>
+        <link rel="stylesheet" href="../styles/api.css"/>
+        <script src="../scripts/api.js"></script>
+        <script src="../scripts/page.js"></script>
+        <script src="../data/index.js"></script>
+    </head>
+    <body>$${html}</body>
+</html>

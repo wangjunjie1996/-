@@ -1,0 +1,3 @@
+{
+    "host": "http://mewchan.com/ver/runtime.${target}.${platform}"
+}

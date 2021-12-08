@@ -1,0 +1,230 @@
+#!/usr/bin/env mew_js
+
+@import("js.test");
+@import("js.test.mgnt");
+
+@.process.mode = "customized";
+
+const switchesRules = {
+    "!defaultTaskMode": "test",
+    "!programName": "mew_test",
+    "!taskModes": {
+        "bench": "benchmark",
+        "benchmark": "benchmark",
+        "test": "test",
+        "help": "help",
+        "version": "version"
+    },
+    "!taskHelp": {
+        "prefix": "Program mew_test targets to help mew_js users to make better\nunit tests",
+        "modes": {
+            "benchmark": {
+                "text": "Benchmark test units",
+                "command": "mew_test bench|benchmark [<path>] <test_case>"
+            },
+            "test": {
+                "text": "Run test units",
+                "command": "mew_test [test] [<path>] [<filters> ...]"
+            },
+            "help": "Print help text",
+            "version": "Report mew_test version"
+        },
+        "examples": [{
+            "command": "mew_test dir",
+            "text": "Scan all test files under the `dir`, and run test\ncases"
+        }, {
+            "command": "mew_test test.js 'some_fn_*_x'",
+            "text": "Run all test cases which match name `some_fn_*_x`\nin the file `test.js`"
+        }, {
+            "command": "mew_test bench test.js test_case_x",
+            "text": "Benchmark test case `test_case_x` in the file\n`test.js`"
+        }],
+        "suffix": "More info is available at https://www.mewchan.com"
+    },
+    "options": {
+        "timeout": {
+            "!valueType": "number", "!defaultValue": 5000,
+            "!switchText": "Timeout for each test case"
+        },
+        "recursive": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Scan test files recursively"
+        },
+        "count": {
+            "!valueType": "number", "!defaultValue": 1000,
+            "!switchText": "Cycle count for benchmark test case"
+        },
+        "parallel": {
+            "!valueType": "number", "!defaultValue": 1,
+            "!switchText": "Parallel running count for benchmark"
+        },
+        "json-output": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Output result as JSON"
+        }
+    },
+    "settings": {
+        "help": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Force to print help text"
+        },
+        "version": {
+            "!valueType": "boolean", "!defaultValue": false,
+            "!switchText": "Force to print mew_test version text"
+        }
+    }
+};
+
+const switches = @.process.switches(switchesRules);
+
+if ((switches.mode === "help") || switches.settings.help) {
+    @.task.printHelp(switchesRules);
+    process.exit(0);
+    return;
+}
+
+if ((switches.mode === "version") || switches.settings.version) {
+    @.process.print("mew_test version 1.0.0");
+    process.exit(0);
+    return;
+}
+
+let testFilters = switches.commands.slice(0);
+
+let basePath = @.process.workingDir;
+if (testFilters[0]) {
+    let testPath = @path(testFilters[0]);
+    if (@.fs.exists.dir(testPath) ||
+        (@.fs.exists.file(testPath) && (@.fs.extname(testPath) === ".js")))  {
+        basePath = testPath;
+        testFilters.shift();
+    }
+}
+
+let initialFiles = [];
+if (@.fs.exists.dir(basePath)) {
+    if (switches.options.recursive) {
+        initialFiles = @.fs.scanFiles.sync(basePath, -1, (record) => {
+            if (record.type === "dir") {
+                if (@.fs.filename(record.path)[0] === ".") {
+                    return false;
+                }
+                return true;
+            }
+            return @.fs.extname(record.path) === ".js";
+        }).filter((record) => {
+            return (record.type === "file");
+        }).map((record) => record.path);
+    } else {
+        initialFiles = @.fs.listFiles(basePath).filter((record) => {
+            return @.fs.extname(record.name) === ".js";
+        }).map((record) => @path(basePath, record.name));
+    }
+} else {
+    initialFiles = [basePath];
+}
+
+for (let file of initialFiles) {
+    @debug(`Loading JS file: ${@.fs.filename(file)}`);
+    try {
+        require(file);
+    } catch (error) {
+        @error(`Failed to load JS file: ${@.fs.filename(file)}`);
+        @error(error);
+    }
+}
+
+switch (switches.mode) {
+
+    case "test": {
+
+        testFilters = testFilters.map((filter) => @.as(filter, "regex-asterisk"));
+
+        @test.start.all(switches.options.timeout, {
+            "filter": function (test) {
+                if (testFilters.length === 0) {
+                    return true;
+                }
+                for (let regex of testFilters) {
+                    if (regex.test(test.name)) {
+                        return true;
+                    }
+                }
+                return false;
+            },
+            "source": function (file) {
+                @info("Test file: " + file);
+            },
+            "progress": function (error, name, time) {
+                if (error) {
+                    @error(`Failed to pass test ${name}`);
+                    @error(error);
+                } else {
+                    @debug(`Passed test ${name} within ${time} ms`);
+                }
+            },
+            "callback": function (error, report) {
+
+                if (error) {
+                    @error(error); process.exit(1);
+                }
+
+                @celebr(`Test finished: ${report.passeds.length} passed, ${report.faileds.length} failed within ${report.time} ms, ${@test.assert.count} asserts in total`);
+                if (switches.options.jsonOutput) {
+                    process.stdout.write(JSON.stringify(report));
+                }
+                process.exit(0);
+
+            }
+        });
+
+        break;
+    };
+
+    case "benchmark": {
+
+        if (testFilters.length === 0) {
+            @error("No test case specified for benchmark"); return;
+        }
+
+        if (testFilters.length > 1) {
+            @error("Only one benchmark test case per execution is permitted"); return;
+        }
+
+        @info(`Starting benchmark ${testFilters[0]}`);
+
+        @benchmark.test(undefined, testFilters[0], switches.options.count, switches.options.parallel, function (error, time, average, succeededs, faileds) {
+
+            if (error) {
+                @error(error); process.exit(1);
+            }
+
+            if (faileds) {
+                @celebr(`Total time: ${time} ms, ${succeededs + faileds} times, ${faileds} faileds`);
+            } else {
+                @celebr(`Total time: ${time} ms, ${succeededs + faileds} times`);
+            }
+
+            @celebr(`Average: ${average} ms, ${(1000 / average).toFixed(3)} tps`);
+            if (switches.options.jsonOutput) {
+                process.stdout.write(JSON.stringify({
+                    "time": time, 
+                    "average": average, 
+                    "succeededs": succeededs, 
+                    "faileds": faileds
+                }));
+            }
+
+            process.exit(0);
+
+        });
+
+        break;
+    };
+
+    default: {
+        @error(`Unknown task type ${switches.mode}`);
+        process.exit(1);
+    };
+
+}
